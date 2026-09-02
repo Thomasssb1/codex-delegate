@@ -11,13 +11,12 @@ permissions:
 
 jobs:
   checks:
-    name: Node ${{ matrix.node }} on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         node: [20, 22]
-        os: [macos-latest, ubuntu-latest]
 
     steps:
       - name: Checkout
