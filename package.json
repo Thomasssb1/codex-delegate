@@ -10,6 +10,9 @@
   "bin": {
     "codex-delegate": "./dist/cli.js"
   },
+  "dependencies": {
+    "commander": "^13.1.0"
+  },
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "lint": "eslint .",
