@@ -1,0 +1,22 @@
+{
+  "name": "codex-delegate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Delegate bounded coding tasks to external agents in isolated Git worktrees.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "codex-delegate": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "start": "npm run build && node dist/cli.js",
+    "test": "npm run build && node --test dist/cli.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "typescript": "5.7.2"
+  }
+}
