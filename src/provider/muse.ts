@@ -1,4 +1,4 @@
-import { MuseClient } from "@muse-code/sdk";
+import { readSessionDurability, Session, spawnMspConnection, type ApprovalDecisionInput, type SpawnedMspConnection } from "@muse-code/sdk";
 import { toMuseApprovalMode, type ApprovalMode } from "../approval-mode.js";
 import { rejectCancelledRun, RunCancelledError } from "../cancellation.js";
 import { ProviderRunError, type Provider, type ProviderRequest, type ProviderResult } from "./provider.js";
@@ -13,9 +13,12 @@ function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Muse run was aborted.");
 }
 
-function waitForClient(clientPromise: Promise<MuseClient>, signal: AbortSignal): Promise<MuseClient> {
+function waitForConnection(
+  connectionPromise: Promise<SpawnedMspConnection>,
+  signal: AbortSignal,
+): Promise<SpawnedMspConnection> {
   if (signal.aborted) {
-    void clientPromise.then((client) => client.close()).catch(() => undefined);
+    void connectionPromise.then((connection) => connection.close()).catch(() => undefined);
     return Promise.reject(abortReason(signal));
   }
 
@@ -23,17 +26,17 @@ function waitForClient(clientPromise: Promise<MuseClient>, signal: AbortSignal):
     const abort = () => reject(abortReason(signal));
 
     signal.addEventListener("abort", abort, { once: true });
-    clientPromise.then(
-      (client) => {
+    connectionPromise.then(
+      (connection) => {
         signal.removeEventListener("abort", abort);
 
         if (signal.aborted) {
-          void client.close().catch(() => undefined);
+          void connection.close().catch(() => undefined);
           reject(abortReason(signal));
           return;
         }
 
-        resolve(client);
+        resolve(connection);
       },
       (error) => {
         signal.removeEventListener("abort", abort);
@@ -43,10 +46,33 @@ function waitForClient(clientPromise: Promise<MuseClient>, signal: AbortSignal):
   });
 }
 
+export function chooseDenial(choices: readonly { acceptsFeedback?: boolean; choiceId: string; decision: string }[]): ApprovalDecisionInput {
+  const denial = choices.find((choice) => choice.decision === "denied" || choice.decision === "deniedPolicyAmendment");
+
+  if (denial === undefined) {
+    throw new Error("Muse requested approval without offering a denial choice.");
+  }
+
+  return {
+    choiceId: denial.choiceId,
+    ...(denial.acceptsFeedback === true ? { feedback: "codex-delegate runs headlessly and cannot approve this action." } : {}),
+  };
+}
+
+function sessionIdFrom(result: Record<string, unknown>): string {
+  const session = result.session;
+
+  if (typeof session !== "object" || session === null || typeof (session as { sessionId?: unknown }).sessionId !== "string") {
+    throw new Error("Muse returned an invalid session/start response.");
+  }
+
+  return (session as { sessionId: string }).sessionId;
+}
+
 export class MuseProvider implements Provider {
   constructor(
     private readonly options: MuseProviderOptions = {
-      approvalMode: "approveForMe",
+      approvalMode: "denyUnmatched",
       binary: "muse",
     },
   ) {}
@@ -68,23 +94,27 @@ export class MuseProvider implements Provider {
   private async runTurn(request: ProviderRequest, stderr: string[]): Promise<ProviderResult> {
     rejectCancelledRun(request.signal);
 
-    const clientPromise = MuseClient.spawn({
+    const handshake = spawnMspConnection({
       args: ["serve"],
-      clientInfo: {
-        name: "codex_delegate",
-        version: "0.1.0",
-      },
+      command: this.options.binary,
       cwd: request.workspaceRoot,
       env: process.env,
-      museBin: this.options.binary,
       onStderr: (chunk) => {
         stderr.push(chunk);
         request.onActivity?.();
       },
     });
-    const client = await waitForClient(clientPromise, request.signal);
+    const client = await waitForConnection(
+      handshake.initialize({
+        clientInfo: {
+          name: "codex_delegate",
+          version: "0.1.0",
+        },
+      }),
+      request.signal,
+    );
 
-    let closePromise: Promise<void> | undefined;
+    let closePromise: Promise<unknown> | undefined;
     const closeClient = () => {
       closePromise ??= client.close();
       return closePromise;
@@ -99,11 +129,88 @@ export class MuseProvider implements Provider {
 
     try {
       rejectCancelledRun(request.signal);
-      const session = await client.startSession({
+      const sessionId = client.connection.mintCommandId();
+      const session = new Session({
+        connection: client.connection,
+        durability: readSessionDurability(client.initializeResult),
+        sessionId,
+      });
+      let interactionError: Error | undefined;
+      let rejectInteraction: (error: Error) => void = () => undefined;
+      const interactionFailure = new Promise<never>((_resolve, reject) => {
+        rejectInteraction = reject;
+      });
+      void interactionFailure.catch(() => undefined);
+      const failInteraction = (error: Error) => {
+        if (interactionError !== undefined) {
+          return;
+        }
+
+        interactionError = error;
+        rejectInteraction(error);
+        void closeClient();
+      };
+      const cancelledInputs = new Set<string>();
+
+      session.onApproval((approval) => {
+        request.onActivity?.();
+
+        try {
+          return chooseDenial(approval.availableChoices);
+        } catch (error) {
+          const approvalError = error instanceof Error ? error : new Error(String(error));
+          failInteraction(approvalError);
+          throw approvalError;
+        }
+      });
+      session.onApprovalError((failure) => {
+        failInteraction(new Error(`Muse approval handling failed: ${failure.kind}.`));
+      });
+      client.connection.onNotification((notification) => {
+        if (notification.params?.sessionId !== sessionId) {
+          return;
+        }
+
+        request.onActivity?.();
+        const applied = session.apply(notification);
+        void applied.io.catch((error) => {
+          failInteraction(error instanceof Error ? error : new Error(String(error)));
+        });
+
+        if (notification.method !== "userInput/requested") {
+          return;
+        }
+
+        const userInputId = notification.params.userInputId;
+        if (typeof userInputId !== "string" || cancelledInputs.has(userInputId)) {
+          return;
+        }
+
+        cancelledInputs.add(userInputId);
+        void client.connection
+          .command("userInput/cancel", {
+            commandId: client.connection.mintCommandId(),
+            reason: "codex-delegate runs headlessly and cannot answer prompts.",
+            sessionId,
+            userInputId,
+          })
+          .then(() => request.onActivity?.())
+          .catch((error) => {
+            failInteraction(error instanceof Error ? error : new Error(String(error)));
+          });
+      });
+      void client.connection.closed.then(() => {
+        session.hostExited({ kind: "transportEof" });
+      });
+      const started = await client.connection.command("session/start", {
         approvalMode: toMuseApprovalMode(this.options.approvalMode),
         modelId: this.options.model,
+        sessionId,
         workspaceRoot: request.workspaceRoot,
       });
+      if (sessionIdFrom(started) !== sessionId) {
+        throw new Error("Muse did not honour the requested session ID.");
+      }
       request.onActivity?.();
       const turn = await session.sendUserTurn({
         input: [{ text: request.prompt, type: "text" }],
@@ -111,14 +218,17 @@ export class MuseProvider implements Provider {
       request.onActivity?.();
       const responses = new Map<string, string>();
 
-      for await (const item of turn.items()) {
-        request.onActivity?.();
-        if (item.kind === "agentMessage" && typeof item.text === "string") {
-          responses.set(item.itemId, item.text);
+      const collectResponses = async () => {
+        for await (const item of turn.items()) {
+          request.onActivity?.();
+          if (item.kind === "agentMessage" && typeof item.text === "string") {
+            responses.set(item.itemId, item.text);
+          }
         }
-      }
+      };
 
-      const outcome = await turn.completed;
+      await Promise.race([collectResponses(), interactionFailure]);
+      const outcome = await Promise.race([turn.completed, interactionFailure]);
       request.onActivity?.();
 
       rejectCancelledRun(request.signal);

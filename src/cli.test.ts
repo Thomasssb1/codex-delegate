@@ -27,9 +27,11 @@ import type { Provider } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
+import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
 import { resolveTask } from "./task.js";
+import { chooseDenial } from "./provider/muse.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
 
@@ -150,7 +152,7 @@ test("loads the bundled test-writer agent", () => {
   assert.equal(agent.source, "bundled");
   assert.equal(agent.description, "Add tests for an existing implementation.");
   assert.equal(agent.provider, "muse");
-  assert.equal(agent.approvalMode, "approveForMe");
+  assert.equal(agent.approvalMode, "denyUnmatched");
   assert.match(agent.instructions, /Write tests for the behaviour described in the task\./);
 });
 
@@ -209,24 +211,53 @@ test("rejects agent profiles with an unsupported provider", (context) => {
   assert.throws(() => loadAgent(repository, "test-writer"), /provider is unsupported: other/);
 });
 
-test("accepts Codex approval modes and rejects Muse mode names", (context) => {
+test("allows only non-interactive approval modes", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
   mkdirSync(join(repository, ".codex-agents"));
   const profilePath = join(repository, ".codex-agents", "test-writer.md");
   writeFileSync(
     profilePath,
-    "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: alwaysAsk\n---\nProject instructions\n",
-  );
-
-  assert.equal(loadAgent(repository, "test-writer").approvalMode, "alwaysAsk");
-
-  writeFileSync(
-    profilePath,
     "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: denyUnmatched\n---\nProject instructions\n",
   );
 
-  assert.throws(() => loadAgent(repository, "test-writer"), /approvalMode must be one of: alwaysAsk, approveForMe, fullAccess/);
+  assert.equal(loadAgent(repository, "test-writer").approvalMode, "denyUnmatched");
+
+  writeFileSync(
+    profilePath,
+    "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: approveForMe\n---\nProject instructions\n",
+  );
+
+  assert.throws(() => loadAgent(repository, "test-writer"), /approvalMode must be one of: denyUnmatched, fullAccess/);
+});
+
+test("uses Muse's default-deny approval mode", () => {
+  assert.equal(toMuseApprovalMode("denyUnmatched"), "denyUnmatched");
+});
+
+test("chooses Muse's offered denial when handling an approval request", () => {
+  assert.deepEqual(
+    chooseDenial([
+      { choiceId: "approve", decision: "approved" },
+      { acceptsFeedback: true, choiceId: "deny", decision: "denied" },
+    ]),
+    {
+      choiceId: "deny",
+      feedback: "codex-delegate runs headlessly and cannot approve this action.",
+    },
+  );
+  assert.throws(() => chooseDenial([{ choiceId: "approve", decision: "approved" }]), /without offering a denial choice/);
+});
+
+test("defaults a run to denyUnmatched", () => {
+  const configuration = resolveRunConfiguration("/not-a-repository", {
+    description: "Profile instructions.",
+    instructions: "Do the task.",
+    name: "test-writer",
+    source: "project",
+  });
+
+  assert.equal(configuration.muse.approvalMode, "denyUnmatched");
 });
 
 test("resolves repository configuration with CLI and profile precedence", (context) => {
@@ -244,13 +275,13 @@ test("resolves repository configuration with CLI and profile precedence", (conte
       "muse:",
       "  binary: configured-muse",
       "  model: configured-model",
-      "  approvalMode: alwaysAsk",
+      "  approvalMode: denyUnmatched",
       "",
     ].join("\n"),
   );
 
   const profile = {
-    approvalMode: "approveForMe" as const,
+    approvalMode: "denyUnmatched" as const,
     description: "Profile instructions.",
     instructions: "Do the task.",
     model: "profile-model",
@@ -260,7 +291,8 @@ test("resolves repository configuration with CLI and profile precedence", (conte
   };
   const configured = resolveRunConfiguration(repository, profile);
   const overridden = resolveRunConfiguration(repository, profile, {
-    approvalMode: "alwaysAsk",
+    allowAll: true,
+    approvalMode: "fullAccess",
     model: "cli-model",
     provider: "muse",
     timeoutMs: parseInactivityTimeout("2m"),
@@ -269,7 +301,7 @@ test("resolves repository configuration with CLI and profile precedence", (conte
   assert.deepEqual(configured, {
     inactivityTimeoutMs: 45_000,
     muse: {
-      approvalMode: "approveForMe",
+      approvalMode: "denyUnmatched",
       binary: "configured-muse",
       model: "profile-model",
     },
@@ -281,7 +313,7 @@ test("resolves repository configuration with CLI and profile precedence", (conte
     },
   });
   assert.equal(overridden.inactivityTimeoutMs, 120_000);
-  assert.equal(overridden.muse.approvalMode, "alwaysAsk");
+  assert.equal(overridden.muse.approvalMode, "fullAccess");
   assert.equal(overridden.muse.model, "cli-model");
 });
 

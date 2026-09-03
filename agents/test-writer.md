@@ -2,7 +2,7 @@
 name: test-writer
 description: Add tests for an existing implementation.
 provider: muse
-approvalMode: approveForMe
+approvalMode: denyUnmatched
 ---
 
 Write tests for the behaviour described in the task. Do not change production code.

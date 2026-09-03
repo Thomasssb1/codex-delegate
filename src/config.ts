@@ -215,7 +215,7 @@ export function resolveRunConfiguration(
     throw new ConfigurationError(`Unsupported provider: ${provider}.`);
   }
 
-  const approvalMode = overrides.approvalMode ?? profile.approvalMode ?? repository.muse?.approvalMode ?? "approveForMe";
+  const approvalMode = overrides.approvalMode ?? profile.approvalMode ?? repository.muse?.approvalMode ?? "denyUnmatched";
   if (approvalMode === "fullAccess" && overrides.allowAll !== true) {
     throw new ConfigurationError("approvalMode=fullAccess requires --allow-all.");
   }

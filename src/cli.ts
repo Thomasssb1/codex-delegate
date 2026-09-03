@@ -98,7 +98,7 @@ program
   .option("--provider <provider>", "Override the profile and repository provider.", parseProvider)
   .option("--task <path>", "Read the task from a UTF-8 file.")
   .option("--timeout <duration>", "Abort after this much provider inactivity.", parseTimeout)
-  .option("--approval-mode <mode>", "Select alwaysAsk, approveForMe, or fullAccess.", parseApprovalMode)
+  .option("--approval-mode <mode>", "Select denyUnmatched or fullAccess.", parseApprovalMode)
   .option("--allow-all", "Required with approval mode fullAccess.")
   .option("--model <name>", "Ask the provider for a specific model.")
   .allowExcessArguments(false)
