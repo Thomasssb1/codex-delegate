@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseDocument } from "yaml";
 import { approvalModes, type ApprovalMode } from "../approval-mode.js";
@@ -159,4 +159,35 @@ export function loadAgent(repositoryRoot: string, name: string): AgentProfile {
 
     throw error;
   }
+}
+
+function agentNamesIn(path: string | URL): string[] {
+  try {
+    return readdirSync(path, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+      .map((entry) => entry.name.slice(0, -3));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+
+    throw error;
+  }
+}
+
+export function listAgents(repositoryRoot?: string): AgentProfile[] {
+  const bundledDirectory = new URL("../../agents/", import.meta.url);
+  const names = new Set(agentNamesIn(bundledDirectory));
+
+  if (repositoryRoot !== undefined) {
+    for (const name of agentNamesIn(join(repositoryRoot, ".codex-agents"))) {
+      names.add(name);
+    }
+  }
+
+  return [...names]
+    .sort()
+    .map((name) => repositoryRoot === undefined
+      ? readProfile(new URL(`../../agents/${name}.md`, import.meta.url), name, "bundled")
+      : loadAgent(repositoryRoot, name));
 }

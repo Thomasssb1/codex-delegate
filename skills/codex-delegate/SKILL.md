@@ -1,11 +1,11 @@
 ---
 name: codex-delegate
-description: Delegate focused test writing to a subagent after implementing a coding change, then inspect and apply an acceptable test patch.
+description: Delegate focused available subagents after implementing a coding change.
 ---
 
 Use this skill after making an implementation change that would benefit from tests. Skip it for a request that is only an explanation, a documentation edit, or where the user asks not to add tests.
 
-`codex-delegate run` spawns a subagent. Use `--help` for command syntax.
+`codex-delegate agents` lists the available agents. Choose one suited to the current task. `codex-delegate run` spawns a subagent. Use `--help` for command syntax.
 
 Inspect the returned JSON before changing the source checkout.
 

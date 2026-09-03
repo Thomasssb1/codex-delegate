@@ -25,7 +25,7 @@ import { createSeededWorktree, removeWorktree } from "./worktree.js";
 import { delegate } from "./delegate.js";
 import type { Provider } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
-import { loadAgent } from "./agents/loader.js";
+import { listAgents, loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
@@ -164,6 +164,39 @@ test("loads the bundled reviewer agent", () => {
   assert.match(agent.instructions, /"verdict": "approved" \| "changes_requested"/);
 });
 
+test("lists bundled agents", () => {
+  assert.deepEqual(
+    listAgents().map(({ name, source }) => ({ name, source })),
+    [
+      { name: "reviewer", source: "bundled" },
+      { name: "test-writer", source: "bundled" },
+    ],
+  );
+});
+
+test("lists available agents through the CLI", (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+
+  const result = runCli(directory, "agents");
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    agents: [
+      {
+        description: "Review the current changes for correctness and regressions.",
+        name: "reviewer",
+        source: "bundled",
+      },
+      {
+        description: "Add tests for an existing implementation.",
+        name: "test-writer",
+        source: "bundled",
+      },
+    ],
+  });
+});
+
 test("uses a project agent before its bundled counterpart", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
@@ -177,6 +210,29 @@ test("uses a project agent before its bundled counterpart", (context) => {
 
   assert.equal(agent.source, "project");
   assert.equal(agent.instructions, "Project instructions");
+});
+
+test("lists project agents and overrides", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\n---\nProject instructions\n",
+  );
+  writeFileSync(
+    join(repository, ".codex-agents", "accessibility.md"),
+    "---\nname: accessibility\ndescription: Review accessibility.\n---\nReview the change.\n",
+  );
+
+  assert.deepEqual(
+    listAgents(repository).map(({ description, name, source }) => ({ description, name, source })),
+    [
+      { description: "Review accessibility.", name: "accessibility", source: "project" },
+      { description: "Review the current changes for correctness and regressions.", name: "reviewer", source: "bundled" },
+      { description: "Project test instructions.", name: "test-writer", source: "project" },
+    ],
+  );
 });
 
 test("rejects an unknown agent profile", () => {

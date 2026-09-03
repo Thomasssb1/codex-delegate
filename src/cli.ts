@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { approvalModes, type ApprovalMode } from "./approval-mode.js";
-import { loadAgent } from "./agents/loader.js";
+import { listAgents, loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
 import { ConfigurationError, parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { delegate } from "./delegate.js";
@@ -65,6 +65,14 @@ function discoverRunRepository(): Repository {
   }
 }
 
+function discoverAgentRepository(): Repository | undefined {
+  try {
+    return discoverRepository(process.cwd());
+  } catch {
+    return undefined;
+  }
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -93,6 +101,17 @@ program
   .description("Delegate bounded coding tasks to external agents.")
   .showSuggestionAfterError()
   .showHelpAfterError()
+
+  .command("agents")
+  .description("List available agents.")
+  .action(() => {
+    const repository = discoverAgentRepository();
+    const agents = listAgents(repository?.root).map(({ description, name, source }) => ({ description, name, source }));
+
+    process.stdout.write(`${JSON.stringify({ agents })}\n`);
+  });
+
+program
   .command("run [task-or-agent] [agent]")
   .description("Delegate a task to an agent.")
   .option("--provider <provider>", "Override the profile and repository provider.", parseProvider)
