@@ -109,7 +109,7 @@ program
     let agents;
 
     try {
-      agents = listAgents(repository?.root).map(({ description, name, source }) => ({ description, name, source }));
+      agents = listAgents(repository?.root).map(({ description, model, name, source }) => ({ description, model, name, source }));
     } catch (error) {
       throw new CliError(errorMessage(error), 2);
     }

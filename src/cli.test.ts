@@ -203,6 +203,22 @@ test("lists available agents through the CLI", (context) => {
   });
 });
 
+test("lists a project agent's model", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\nmodel: muse-spark-1.3\n---\nProject instructions\n",
+  );
+
+  const result = runCli(repository, "agents");
+
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout) as { agents: { model?: string; name: string }[] };
+  assert.equal(output.agents.find((agent) => agent.name === "test-writer")?.model, "muse-spark-1.3");
+});
+
 test("reports invalid project agent profiles with exit code 2", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
