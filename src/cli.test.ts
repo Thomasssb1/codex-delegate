@@ -390,6 +390,18 @@ test("rejects providers other than Muse", (context) => {
   assert.equal(output.stderr, "");
 });
 
+test("shows run help without a JSON error result", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+
+  const result = runCli(repository, "run", "--help");
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /Usage: codex-delegate run/);
+  assert.doesNotMatch(result.stdout, /"error"/);
+  assert.equal(result.stderr, "");
+});
+
 test("requires one non-empty task source", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));

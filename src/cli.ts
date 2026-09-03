@@ -182,6 +182,10 @@ program
   );
 
 program.parseAsync().catch((error: unknown) => {
+  if (error instanceof CommanderError && error.code === "commander.helpDisplayed") {
+    return;
+  }
+
   const runResult = createFailedRunResult(errorMessage(error));
 
   process.stderr.write(`${runResult.error}\n`);
