@@ -5,6 +5,8 @@ description: Delegate a bounded coding task to an available subagent.
 
 Use this skill when another workflow needs an isolated subagent run.
 
+Before invoking the CLI, run `command -v codex-delegate`.
+
 `codex-delegate agents` lists the available agents. Choose one suited to the current task. `codex-delegate run` spawns a subagent. Use `--help` for command syntax.
 
 Inspect the returned JSON before changing the source checkout.

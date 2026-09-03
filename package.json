@@ -4,6 +4,12 @@
   "private": true,
   "description": "Delegate bounded coding tasks to external agents in isolated Git worktrees.",
   "type": "module",
+  "files": [
+    "dist",
+    "skills",
+    "providers.json",
+    "agents"
+  ],
   "engines": {
     "node": ">=20"
   },
