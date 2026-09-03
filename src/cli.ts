@@ -2,7 +2,6 @@
 
 import { Command, CommanderError, InvalidArgumentError } from "commander";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { approvalModes, type ApprovalMode } from "./approval-mode.js";
@@ -17,6 +16,7 @@ import { createPrompt } from "./prompt.js";
 import { discoverRepository, type Repository } from "./repository.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
 import { resolveTask, TaskSourceError } from "./task.js";
+import { createInteractionResponder } from "./interaction.js";
 
 type Provider = string;
 
@@ -113,11 +113,11 @@ program
 
 program
   .command("run [task-or-agent] [agent]")
-  .description("Delegate a task to an agent.")
+  .description("Delegate a task to an agent. Standard input accepts JSON interaction replies.")
   .option("--provider <provider>", "Override the profile and repository provider.", parseProvider)
   .option("--task <path>", "Read the task from a UTF-8 file.")
   .option("--timeout <duration>", "Abort after this much provider inactivity.", parseTimeout)
-  .option("--approval-mode <mode>", "Select alwaysAsk, approveForMe, or fullAccess.", parseApprovalMode)
+  .option("--approval-mode <mode>", "Select alwaysAsk, approveForMe, denyUnmatched, or fullAccess.", parseApprovalMode)
   .option("--allow-all", "Required with approval mode fullAccess.")
   .option("--model <name>", "Ask the provider for a specific model.")
   .allowExcessArguments(false)
@@ -132,20 +132,18 @@ program
         provider?: Provider;
         task?: string;
         timeout?: number;
-      },
-    ) => {
+    },
+  ) => {
     let cancellation: ReturnType<typeof createRunCancellation> | undefined;
+    let interactions: ReturnType<typeof createInteractionResponder> | undefined;
 
     try {
       const { agent, task } = resolveTask({
         agent: positionalAgent,
         positional: taskOrAgent,
-        stdin: {
-          isTTY: process.stdin.isTTY,
-          read: () => readFileSync(0),
-        },
         taskPath: options.task,
       });
+      interactions = createInteractionResponder(process.stdin, process.stdout);
 
       const repository = discoverRunRepository();
       let profile;
@@ -175,6 +173,18 @@ program
         onActivity: cancellation.onActivity,
         prompt: createPrompt(profile.instructions, task),
         provider: new MuseProvider(configuration.muse),
+        requestInteraction: async (interaction) => {
+          cancellation?.pause();
+          try {
+            if (interactions === undefined) {
+              throw new Error("Codex interaction support is unavailable.");
+            }
+
+            return await interactions.request(interaction);
+          } finally {
+            cancellation?.resume();
+          }
+        },
         repository,
         signal: cancellation.signal,
         snapshotLimits: configuration.snapshotLimits,
@@ -196,6 +206,7 @@ program
       process.exitCode = exitCodeFor(error);
     } finally {
       cancellation?.dispose();
+      interactions?.close();
     }
     },
   );

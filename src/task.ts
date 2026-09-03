@@ -12,10 +12,6 @@ export type TaskResolution = {
 export type TaskSourceInput = {
   agent?: string;
   positional?: string;
-  stdin: {
-    isTTY?: boolean;
-    read(): Buffer;
-  };
   taskPath?: string;
 };
 
@@ -56,29 +52,21 @@ function assertAgentName(agent: string): string {
 }
 
 export function resolveTask(input: TaskSourceInput): TaskResolution {
-  const stdin = input.stdin.isTTY === true ? undefined : input.stdin.read();
-  const hasStdinTask = stdin !== undefined && stdin.length > 0;
   const hasTaskFile = input.taskPath !== undefined;
 
-  if (hasTaskFile || hasStdinTask) {
+  if (hasTaskFile) {
     if (input.agent !== undefined) {
-      throw new TaskSourceError("Use only one positional agent name with --task or stdin task input.");
-    }
-
-    if (hasTaskFile && hasStdinTask) {
-      throw new TaskSourceError("Supply a task from either --task or stdin, not both.");
+      throw new TaskSourceError("Use only one positional agent name with --task.");
     }
 
     const agent = assertAgentName(input.positional ?? "test-writer");
-    const task = hasTaskFile
-      ? readTaskFile(input.taskPath as string)
-      : decodeTask(stdin as Buffer, "stdin");
+    const task = readTaskFile(input.taskPath as string);
 
     return { agent, task };
   }
 
   if (input.positional === undefined) {
-    throw new TaskSourceError("Supply a task as a positional argument, --task file, or stdin.");
+    throw new TaskSourceError("Supply a task as a positional argument or --task file.");
   }
 
   return {

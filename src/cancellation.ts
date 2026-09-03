@@ -17,6 +17,8 @@ type SignalEmitter = {
 export type RunCancellation = {
   dispose(): void;
   onActivity(): void;
+  pause(): void;
+  resume(): void;
   signal: AbortSignal;
 };
 
@@ -27,8 +29,13 @@ export function createRunCancellation(
   const controller = new AbortController();
   const interrupt = () => controller.abort(new RunCancelledError("signal"));
   let timeout: NodeJS.Timeout | undefined;
+  let pauses = 0;
   const onActivity = () => {
     clearTimeout(timeout);
+    if (pauses > 0) {
+      return;
+    }
+
     timeout = setTimeout(() => controller.abort(new RunCancelledError("inactivity")), inactivityTimeoutMs);
   };
 
@@ -40,6 +47,20 @@ export function createRunCancellation(
       signalEmitter.off("SIGINT", interrupt);
     },
     onActivity,
+    pause() {
+      pauses += 1;
+      clearTimeout(timeout);
+    },
+    resume() {
+      if (pauses === 0) {
+        return;
+      }
+
+      pauses -= 1;
+      if (pauses === 0) {
+        onActivity();
+      }
+    },
     signal: controller.signal,
   };
 }

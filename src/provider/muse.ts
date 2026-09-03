@@ -1,7 +1,16 @@
-import { MuseClient } from "@muse-code/sdk";
+import { readSessionDurability, Session, spawnMspConnection, type SpawnedMspConnection } from "@muse-code/sdk";
 import { toMuseApprovalMode, type ApprovalMode } from "../approval-mode.js";
 import { rejectCancelledRun, RunCancelledError } from "../cancellation.js";
-import { ProviderRunError, type Provider, type ProviderRequest, type ProviderResult } from "./provider.js";
+import {
+  ProviderRunError,
+  type ApprovalRequest,
+  type InteractionRequest,
+  type InteractionResponse,
+  type Provider,
+  type ProviderRequest,
+  type ProviderResult,
+  type UserInputRequest,
+} from "./provider.js";
 
 export type MuseProviderOptions = {
   approvalMode: ApprovalMode;
@@ -13,9 +22,9 @@ function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Muse run was aborted.");
 }
 
-function waitForClient(clientPromise: Promise<MuseClient>, signal: AbortSignal): Promise<MuseClient> {
+function waitForConnection(connectionPromise: Promise<SpawnedMspConnection>, signal: AbortSignal): Promise<SpawnedMspConnection> {
   if (signal.aborted) {
-    void clientPromise.then((client) => client.close()).catch(() => undefined);
+    void connectionPromise.then((connection) => connection.close()).catch(() => undefined);
     return Promise.reject(abortReason(signal));
   }
 
@@ -23,17 +32,16 @@ function waitForClient(clientPromise: Promise<MuseClient>, signal: AbortSignal):
     const abort = () => reject(abortReason(signal));
 
     signal.addEventListener("abort", abort, { once: true });
-    clientPromise.then(
-      (client) => {
+    connectionPromise.then(
+      (connection) => {
         signal.removeEventListener("abort", abort);
-
         if (signal.aborted) {
-          void client.close().catch(() => undefined);
+          void connection.close().catch(() => undefined);
           reject(abortReason(signal));
           return;
         }
 
-        resolve(client);
+        resolve(connection);
       },
       (error) => {
         signal.removeEventListener("abort", abort);
@@ -41,6 +49,84 @@ function waitForClient(clientPromise: Promise<MuseClient>, signal: AbortSignal):
       },
     );
   });
+}
+
+function sessionIdFrom(result: Record<string, unknown>): string {
+  const session = result.session;
+
+  if (typeof session !== "object" || session === null || typeof (session as { sessionId?: unknown }).sessionId !== "string") {
+    throw new Error("Muse returned an invalid session response.");
+  }
+
+  return (session as { sessionId: string }).sessionId;
+}
+
+function toApprovalRequest(value: {
+  approvalId: string;
+  availableChoices: readonly { acceptsFeedback?: boolean; choiceId: string; decision: string; label: string }[];
+  currentRequirementId: { approvalId: string; sourceIndex: number };
+  toolName: string;
+  turnId: string;
+}): ApprovalRequest {
+  return {
+    approvalId: value.approvalId,
+    choices: value.availableChoices.map((choice) => ({
+      ...(choice.acceptsFeedback === true ? { acceptsFeedback: true } : {}),
+      choiceId: choice.choiceId,
+      decision: choice.decision,
+      label: choice.label,
+    })),
+    kind: "approval",
+    requirementId: value.currentRequirementId,
+    toolName: value.toolName,
+    turnId: value.turnId,
+  };
+}
+
+function toUserInputRequest(value: {
+  questions: readonly {
+    header: string;
+    id: string;
+    options: readonly { description?: string; label: string }[];
+    question: string;
+    selection: { maxSelections?: number; minSelections?: number; mode: "multiple" | "single" };
+  }[];
+  toolName: string;
+  turnId: string;
+  userInputId: string;
+}): UserInputRequest {
+  return {
+    kind: "userInput",
+    questions: value.questions.map((question) => ({
+      header: question.header,
+      id: question.id,
+      options: question.options.map((option) => ({
+        ...(option.description === undefined ? {} : { description: option.description }),
+        label: option.label,
+      })),
+      question: question.question,
+      selection: question.selection,
+    })),
+    toolName: value.toolName,
+    turnId: value.turnId,
+    userInputId: value.userInputId,
+  };
+}
+
+function approvalResponse(request: ApprovalRequest, response: InteractionResponse): Extract<InteractionResponse, { kind: "approval" }> {
+  if (response.kind !== "approval" || !request.choices.some((choice) => choice.choiceId === response.choiceId)) {
+    throw new Error("The response does not match the pending Muse approval request.");
+  }
+
+  return response;
+}
+
+function userInputResponse(response: InteractionResponse): Extract<InteractionResponse, { kind: "userInput" }> {
+  if (response.kind !== "userInput") {
+    throw new Error("The response does not match the pending Muse input request.");
+  }
+
+  return response;
 }
 
 export class MuseProvider implements Provider {
@@ -61,30 +147,29 @@ export class MuseProvider implements Provider {
         throw error;
       }
 
+      rejectCancelledRun(request.signal);
       throw new ProviderRunError(error instanceof Error ? error.message : String(error), stderr.join(""), { cause: error });
     }
   }
 
   private async runTurn(request: ProviderRequest, stderr: string[]): Promise<ProviderResult> {
     rejectCancelledRun(request.signal);
-
-    const clientPromise = MuseClient.spawn({
+    const handshake = spawnMspConnection({
       args: ["serve"],
-      clientInfo: {
-        name: "codex_delegate",
-        version: "0.1.0",
-      },
+      command: this.options.binary,
       cwd: request.workspaceRoot,
       env: process.env,
-      museBin: this.options.binary,
       onStderr: (chunk) => {
         stderr.push(chunk);
         request.onActivity?.();
       },
     });
-    const client = await waitForClient(clientPromise, request.signal);
+    const client = await waitForConnection(
+      handshake.initialize({ clientInfo: { name: "codex_delegate", version: "0.1.0" } }),
+      request.signal,
+    );
 
-    let closePromise: Promise<void> | undefined;
+    let closePromise: Promise<unknown> | undefined;
     const closeClient = () => {
       closePromise ??= client.close();
       return closePromise;
@@ -92,51 +177,119 @@ export class MuseProvider implements Provider {
     const abort = () => {
       void closeClient();
     };
-
     request.signal.addEventListener("abort", abort, { once: true });
     let providerResult: ProviderResult | undefined;
     let closeError: unknown;
 
     try {
-      rejectCancelledRun(request.signal);
-      const session = await client.startSession({
+      const sessionId = client.connection.mintCommandId();
+      const session = new Session({
+        connection: client.connection,
+        durability: readSessionDurability(client.initializeResult),
+        sessionId,
+      });
+      let interactionError: Error | undefined;
+      let rejectInteraction: (error: Error) => void = () => undefined;
+      const interactionFailure = new Promise<never>((_resolve, reject) => {
+        rejectInteraction = reject;
+      });
+      void interactionFailure.catch(() => undefined);
+      const failInteraction = (error: Error) => {
+        if (interactionError !== undefined) {
+          return;
+        }
+
+        interactionError = error;
+        rejectInteraction(error);
+        void closeClient();
+      };
+      const askCodex = async (interaction: InteractionRequest): Promise<InteractionResponse> => {
+        if (request.requestInteraction === undefined) {
+          throw new Error("Muse requested interaction, but the caller cannot respond.");
+        }
+
+        request.onActivity?.();
+        return request.requestInteraction(interaction);
+      };
+
+      session.onApproval(async (approval) => {
+        try {
+          const interaction = toApprovalRequest(approval);
+          const response = approvalResponse(interaction, await askCodex(interaction));
+          request.onActivity?.();
+          return {
+            choiceId: response.choiceId,
+            ...(response.feedback === undefined ? {} : { feedback: response.feedback }),
+          };
+        } catch (error) {
+          const approvalError = error instanceof Error ? error : new Error(String(error));
+          failInteraction(approvalError);
+          throw approvalError;
+        }
+      });
+      session.onApprovalError((failure) => {
+        failInteraction(new Error(`Muse approval handling failed: ${failure.kind}.`));
+      });
+      client.connection.onNotification((notification) => {
+        if (notification.params?.sessionId !== sessionId) {
+          return;
+        }
+
+        request.onActivity?.();
+        const applied = session.apply(notification);
+        void applied.io.catch((error) => {
+          failInteraction(error instanceof Error ? error : new Error(String(error)));
+        });
+
+        if (notification.method !== "userInput/requested") {
+          return;
+        }
+
+        const input = toUserInputRequest(notification.params as Parameters<typeof toUserInputRequest>[0]);
+        void askCodex(input)
+          .then((response) => client.connection.command("userInput/answer", {
+            answers: userInputResponse(response).answers,
+            sessionId,
+            userInputId: input.userInputId,
+          }))
+          .then(() => request.onActivity?.())
+          .catch((error) => {
+            failInteraction(error instanceof Error ? error : new Error(String(error)));
+          });
+      });
+      void client.connection.closed.then(() => {
+        session.hostExited({ kind: "transportEof" });
+      });
+      const started = await client.connection.command("session/start", {
         approvalMode: toMuseApprovalMode(this.options.approvalMode),
         modelId: this.options.model,
+        sessionId,
         workspaceRoot: request.workspaceRoot,
       });
-      request.onActivity?.();
-      const turn = await session.sendUserTurn({
-        input: [{ text: request.prompt, type: "text" }],
-      });
-      request.onActivity?.();
-      const responses = new Map<string, string>();
-
-      for await (const item of turn.items()) {
-        request.onActivity?.();
-        if (item.kind === "agentMessage" && typeof item.text === "string") {
-          responses.set(item.itemId, item.text);
-        }
+      if (sessionIdFrom(started) !== sessionId) {
+        throw new Error("Muse did not honour the requested session ID.");
       }
 
-      const outcome = await turn.completed;
-      request.onActivity?.();
+      const turn = await session.sendUserTurn({ input: [{ text: request.prompt, type: "text" }] });
+      const responses = new Map<string, string>();
+      const collectResponses = async () => {
+        for await (const item of turn.items()) {
+          request.onActivity?.();
+          if (item.kind === "agentMessage" && typeof item.text === "string") {
+            responses.set(item.itemId, item.text);
+          }
+        }
+      };
 
-      rejectCancelledRun(request.signal);
-
+      await Promise.race([collectResponses(), interactionFailure]);
+      const outcome = await Promise.race([turn.completed, interactionFailure]);
       if (outcome.kind !== "completed" || outcome.params.terminal !== "completed") {
         throw new Error("Muse did not complete the turn successfully.");
       }
 
-      providerResult = {
-        response: [...responses.values()].join("\n"),
-        stderr: stderr.join(""),
-      };
-    } catch (error) {
-      rejectCancelledRun(request.signal);
-      throw error;
+      providerResult = { response: [...responses.values()].join("\n"), stderr: stderr.join("") };
     } finally {
       request.signal.removeEventListener("abort", abort);
-
       try {
         await closeClient();
       } catch (error) {
@@ -146,10 +299,10 @@ export class MuseProvider implements Provider {
       }
     }
 
+    rejectCancelledRun(request.signal);
     if (closeError !== undefined) {
       throw closeError;
     }
-
     if (providerResult === undefined) {
       throw new Error("Muse did not return a result.");
     }
