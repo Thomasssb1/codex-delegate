@@ -36,6 +36,37 @@ function createRepository(): string {
   return repository;
 }
 
+type RepositoryState = {
+  head: string;
+  indexDiff: Buffer;
+  status: string;
+  worktreeDiff: Buffer;
+};
+
+function captureRepositoryState(repository: string): RepositoryState {
+  return {
+    head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" }),
+    indexDiff: execFileSync("git", ["diff", "--cached", "--binary"], { cwd: repository }),
+    status: execFileSync("git", ["status", "--porcelain=v1"], { cwd: repository, encoding: "utf8" }),
+    worktreeDiff: execFileSync("git", ["diff", "--binary"], { cwd: repository }),
+  };
+}
+
+function assertRepositoryState(repository: string, expected: RepositoryState): void {
+  assert.deepEqual(captureRepositoryState(repository), expected);
+}
+
+function createDirtyRepository(): string {
+  const repository = createRepository();
+
+  writeFileSync(join(repository, "README.md"), "Staged change\n");
+  runGit(repository, ["add", "README.md"]);
+  writeFileSync(join(repository, "README.md"), "Staged and unstaged change\n");
+  writeFileSync(join(repository, "untracked.txt"), "Caller change\n");
+
+  return repository;
+}
+
 function runCli(cwd: string, ...arguments_: string[]) {
   return spawnSync(process.execPath, [cliPath, ...arguments_], {
     cwd,
@@ -221,15 +252,14 @@ test(
 );
 
 test("accepts uncommitted changes for a later worker snapshot", (context) => {
-  const repository = createRepository();
+  const repository = createDirtyRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
-  writeFileSync(join(repository, "untracked.txt"), "dirty\n");
 
   assert.equal(discoverRepository(repository).root, realpathSync(repository));
 });
 
 test("seeds a worker with caller changes without changing the caller", (context) => {
-  const repositoryRoot = createRepository();
+  const repositoryRoot = createDirtyRepository();
   const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
   const repository = discoverRepository(repositoryRoot);
   context.after(() => {
@@ -240,27 +270,14 @@ test("seeds a worker with caller changes without changing the caller", (context)
     rmSync(repositoryRoot, { force: true, recursive: true });
   });
 
-  writeFileSync(join(repositoryRoot, "README.md"), "Staged change\n");
-  runGit(repositoryRoot, ["add", "README.md"]);
-  writeFileSync(join(repositoryRoot, "README.md"), "Staged and unstaged change\n");
-  writeFileSync(join(repositoryRoot, "untracked.txt"), "Caller change\n");
-  const sourceStatus = execFileSync("git", ["status", "--porcelain=v1"], {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-  });
+  const sourceState = captureRepositoryState(repositoryRoot);
 
   const snapshot = createSeededWorktree(repository, worktree);
 
   assert.equal(readFileSync(join(worktree, "README.md"), "utf8"), "Staged and unstaged change\n");
   assert.equal(readFileSync(join(worktree, "untracked.txt"), "utf8"), "Caller change\n");
   assert.notEqual(snapshot.baseline, repository.head);
-  assert.equal(
-    execFileSync("git", ["status", "--porcelain=v1"], {
-      cwd: repositoryRoot,
-      encoding: "utf8",
-    }),
-    sourceStatus,
-  );
+  assertRepositoryState(repositoryRoot, sourceState);
 
   writeFileSync(join(worktree, "agent.test.ts"), "export {};\n");
   runGit(worktree, ["add", "agent.test.ts"]);
