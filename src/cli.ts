@@ -2,7 +2,6 @@
 
 import { Command, CommanderError, InvalidArgumentError } from "commander";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { approvalModes, type ApprovalMode } from "./approval-mode.js";
@@ -95,7 +94,7 @@ program
   .showSuggestionAfterError()
   .showHelpAfterError()
   .command("run [task-or-agent] [agent]")
-  .description("Delegate a task to an agent.")
+  .description("Delegate a task to an agent. Standard input accepts JSON interaction replies.")
   .option("--provider <provider>", "Override the profile and repository provider.", parseProvider)
   .option("--task <path>", "Read the task from a UTF-8 file.")
   .option("--timeout <duration>", "Abort after this much provider inactivity.", parseTimeout)
@@ -123,10 +122,6 @@ program
       const { agent, task } = resolveTask({
         agent: positionalAgent,
         positional: taskOrAgent,
-        stdin: {
-          isTTY: process.stdin.isTTY,
-          read: () => readFileSync(0),
-        },
         taskPath: options.task,
       });
       interactions = createInteractionResponder(process.stdin, process.stdout);

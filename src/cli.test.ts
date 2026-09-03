@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
@@ -534,10 +534,10 @@ test("requires one non-empty task source", (context) => {
   const result = runCli(repository, "run", "--provider", "muse");
 
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /Supply a task as a positional argument, --task file, or stdin/);
+  assert.match(result.stderr, /Supply a task as a positional argument or --task file/);
 });
 
-test("resolves positional, file, and stdin task input", (context) => {
+test("resolves positional and file task input", (context) => {
   const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
   const taskPath = join(directory, "task.md");
   context.after(() => rmSync(directory, { force: true, recursive: true }));
@@ -547,66 +547,77 @@ test("resolves positional, file, and stdin task input", (context) => {
     resolveTask({
       agent: "custom-agent",
       positional: "A positional task.",
-      stdin: { isTTY: true, read: () => Buffer.alloc(0) },
     }),
     { agent: "custom-agent", task: "A positional task." },
   );
   assert.deepEqual(
     resolveTask({
       positional: "custom-agent",
-      stdin: { isTTY: true, read: () => Buffer.alloc(0) },
       taskPath,
     }),
     { agent: "custom-agent", task: "A task from a file.\n" },
   );
-  assert.deepEqual(
-    resolveTask({
-      positional: "custom-agent",
-      stdin: { isTTY: false, read: () => Buffer.from("A task from stdin.\n") },
-    }),
-    { agent: "custom-agent", task: "A task from stdin.\n" },
-  );
 });
 
 test("rejects ambiguous, empty, and invalid task sources", () => {
-  const terminal = { isTTY: true, read: () => Buffer.alloc(0) };
-  const pipe = { isTTY: false, read: () => Buffer.from("A task from stdin.\n") };
-
   assert.throws(
-    () => resolveTask({ positional: "task", stdin: pipe, taskPath: "task.md" }),
-    /either --task or stdin, not both/,
-  );
-  assert.throws(
-    () => resolveTask({ agent: "agent", positional: "task", stdin: pipe }),
+    () => resolveTask({ positional: "task", agent: "agent", taskPath: "task.md" }),
     /only one positional agent name/,
   );
   assert.throws(
-    () => resolveTask({ positional: "   ", stdin: terminal }),
-    /must be non-empty/,
+    () => resolveTask({}),
+    /positional argument or --task file/,
   );
   assert.throws(
-    () => resolveTask({ positional: "agent", stdin: { isTTY: false, read: () => Buffer.from([0xff]) } }),
-    /not valid UTF-8/,
+    () => resolveTask({ positional: "   " }),
+    /must be non-empty/,
   );
 });
 
-test("accepts file and stdin task input before repository discovery", (context) => {
+test("accepts file task input before repository discovery", (context) => {
   const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
   const taskPath = join(directory, "task.md");
   context.after(() => rmSync(directory, { force: true, recursive: true }));
   writeFileSync(taskPath, "A task from a file.\n");
 
   const fileResult = runCli(directory, "run", "test-writer", "--task", taskPath, "--provider", "muse");
-  const stdinResult = spawnSync(process.execPath, [cliPath, "run", "test-writer", "--provider", "muse"], {
-    cwd: directory,
-    encoding: "utf8",
-    input: "A task from stdin.\n",
-  });
 
   assert.equal(fileResult.status, 5);
   assert.match(fileResult.stderr, /Run codex-delegate from inside a non-bare Git worktree/);
-  assert.equal(stdinResult.status, 5);
-  assert.match(stdinResult.stderr, /Run codex-delegate from inside a non-bare Git worktree/);
+});
+
+test("does not drain stdin when a task is supplied outside stdin", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+
+  for (const arguments_ of [
+    ["run", "A positional task.", "--provider", "muse"],
+    ["run", "test-writer", "--task", join(directory, "task.md"), "--provider", "muse"],
+  ]) {
+    writeFileSync(join(directory, "task.md"), "A task from a file.\n");
+    const child = spawn(process.execPath, [cliPath, ...arguments_], {
+      cwd: directory,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill();
+        reject(new Error("CLI waited for EOF on stdin."));
+      }, 1_000);
+      child.once("close", (code) => {
+        clearTimeout(timeout);
+        resolve(code);
+      });
+    });
+
+    assert.equal(exitCode, 5);
+    assert.match(stderr, /Run codex-delegate from inside a non-bare Git worktree/);
+  }
 });
 
 test("discovers the Git root from a nested directory", (context) => {
