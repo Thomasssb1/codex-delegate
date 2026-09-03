@@ -9,7 +9,7 @@ Use this skill when another workflow needs an isolated subagent run.
 
 Inspect the returned JSON before changing the source checkout.
 
-- If it has `error`, do not apply a patch. Report the failed delegation and continue the calling workflow without pretending it succeeded.
+- If it has `error`, do not apply a patch. If `error` or `stderr` clearly says that Muse usage, quota, or credits are exhausted, complete the task yourself unless the user explicitly asked for delegation only or told you not to. Otherwise, report the failed delegation and continue the calling workflow without pretending it succeeded.
 - If `patch` is absent or empty, inspect `response` and continue the calling workflow.
 - If `patch` is present, read it. Apply it with normal patch tooling only when it is appropriate for the calling workflow and does not include unrelated edits.
 
