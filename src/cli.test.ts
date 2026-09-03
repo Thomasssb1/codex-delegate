@@ -32,6 +32,7 @@ import { createInteractionResponder } from "./interaction.js";
 import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
+import { MuseProvider } from "./provider/muse.js";
 import { resolveTask } from "./task.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
@@ -497,6 +498,44 @@ test("pauses the inactivity deadline while Codex answers Muse", async () => {
 
   assert.equal(cancellation.signal.aborted, false);
   cancellation.dispose();
+});
+
+test("waits for every pending Muse interaction before resuming the inactivity deadline", async () => {
+  const cancellation = createRunCancellation(10, new EventEmitter());
+  cancellation.onActivity();
+  cancellation.pause();
+  cancellation.pause();
+  cancellation.resume();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(cancellation.signal.aborted, false);
+  cancellation.resume();
+  await new Promise<void>((resolve) => cancellation.signal.addEventListener("abort", () => resolve(), { once: true }));
+  assert.equal(cancellation.signal.reason instanceof RunCancelledError, true);
+  assert.equal(cancellation.signal.reason.cause, "inactivity");
+  cancellation.dispose();
+});
+
+test("preserves cancellation when closing Muse makes a session operation fail", async () => {
+  for (const cause of ["inactivity", "signal"] as const) {
+    const controller = new AbortController();
+    const provider = new MuseProvider();
+    const unsafeProvider = provider as unknown as { runTurn(): Promise<never> };
+    unsafeProvider.runTurn = async () => {
+      controller.abort(new RunCancelledError(cause));
+      throw new Error("Muse transport closed.");
+    };
+
+    await assert.rejects(
+      provider.run({
+        prompt: "Do the task.",
+        signal: controller.signal,
+        workspaceRoot: process.cwd(),
+      }),
+      (error: unknown) => error instanceof RunCancelledError && error.cause === cause,
+    );
+  }
 });
 
 test("cancels a run when it receives SIGINT", () => {

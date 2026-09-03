@@ -147,6 +147,7 @@ export class MuseProvider implements Provider {
         throw error;
       }
 
+      rejectCancelledRun(request.signal);
       throw new ProviderRunError(error instanceof Error ? error.message : String(error), stderr.join(""), { cause: error });
     }
   }

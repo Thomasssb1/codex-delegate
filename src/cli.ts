@@ -163,7 +163,7 @@ program
 
             return await interactions.request(interaction);
           } finally {
-            cancellation?.onActivity();
+            cancellation?.resume();
           }
         },
         repository,
