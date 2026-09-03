@@ -93,6 +93,7 @@ program
       const worktree = join(tmpdir(), `codex-delegate-${randomUUID()}`);
       cancellation = createRunCancellation();
       const result = await delegate({
+        onActivity: cancellation.onActivity,
         prompt: createPrompt(profile.instructions, task),
         provider: new MuseProvider(),
         repository,

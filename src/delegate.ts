@@ -11,6 +11,7 @@ export type DelegationResult = {
 };
 
 export type DelegationRequest = {
+  onActivity?(): void;
   prompt: string;
   provider: Provider;
   repository: Repository;
@@ -23,7 +24,9 @@ export async function delegate(request: DelegationRequest): Promise<DelegationRe
   const snapshot = createSeededWorktree(request.repository, request.worktree);
 
   try {
+    request.onActivity?.();
     const providerResult = await request.provider.run({
+      onActivity: request.onActivity,
       prompt: request.prompt,
       signal: request.signal,
       workspaceRoot: snapshot.worktree,

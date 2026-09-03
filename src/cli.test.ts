@@ -146,6 +146,9 @@ test("loads the bundled test-writer agent", () => {
   const agent = loadAgent("/not-a-repository", "test-writer");
 
   assert.equal(agent.source, "bundled");
+  assert.equal(agent.description, "Add tests for an existing implementation.");
+  assert.equal(agent.provider, "muse");
+  assert.equal(agent.approvalMode, "approveForMe");
   assert.match(agent.instructions, /Write tests for the behaviour described in the task\./);
 });
 
@@ -153,7 +156,10 @@ test("uses a project agent before its bundled counterpart", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
   mkdirSync(join(repository, ".codex-agents"));
-  writeFileSync(join(repository, ".codex-agents", "test-writer.md"), "Project instructions\n");
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\n---\nProject instructions\n",
+  );
 
   const agent = loadAgent(repository, "test-writer");
 
@@ -161,20 +167,84 @@ test("uses a project agent before its bundled counterpart", (context) => {
   assert.equal(agent.instructions, "Project instructions");
 });
 
-test("uses a generic role prompt for an unknown agent", () => {
-  const agent = loadAgent("/not-a-repository", "reviewer");
-
-  assert.equal(agent.source, "generic");
-  assert.equal(agent.instructions, "You are acting as the reviewer agent. Complete the task carefully.");
+test("rejects an unknown agent profile", () => {
+  assert.throws(() => loadAgent("/not-a-repository", "reviewer"), /Agent profile not found: reviewer/);
 });
 
-test("cancels a run when its timeout elapses", async () => {
+test("rejects output metadata until the wrapper uses it", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\nmode: write\n---\nProject instructions\n",
+  );
+
+  assert.throws(() => loadAgent(repository, "test-writer"), /unknown front matter key: mode/);
+});
+
+test("rejects agent profiles whose name does not match their filename", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: another-agent\ndescription: Project test instructions.\n---\nProject instructions\n",
+  );
+
+  assert.throws(() => loadAgent(repository, "test-writer"), /name must match the requested agent: test-writer/);
+});
+
+test("rejects agent profiles with an unsupported provider", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\nprovider: other\n---\nProject instructions\n",
+  );
+
+  assert.throws(() => loadAgent(repository, "test-writer"), /provider is unsupported: other/);
+});
+
+test("accepts Codex approval modes and rejects Muse mode names", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  const profilePath = join(repository, ".codex-agents", "test-writer.md");
+  writeFileSync(
+    profilePath,
+    "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: alwaysAsk\n---\nProject instructions\n",
+  );
+
+  assert.equal(loadAgent(repository, "test-writer").approvalMode, "alwaysAsk");
+
+  writeFileSync(
+    profilePath,
+    "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: denyUnmatched\n---\nProject instructions\n",
+  );
+
+  assert.throws(() => loadAgent(repository, "test-writer"), /approvalMode must be one of: alwaysAsk, approveForMe, fullAccess/);
+});
+
+test("cancels a run after its inactivity deadline elapses", async () => {
   const cancellation = createRunCancellation(1, new EventEmitter());
+  cancellation.onActivity();
 
   await new Promise<void>((resolve) => cancellation.signal.addEventListener("abort", () => resolve(), { once: true }));
 
   assert.equal(cancellation.signal.reason instanceof RunCancelledError, true);
-  assert.equal(cancellation.signal.reason.cause, "timeout");
+  assert.equal(cancellation.signal.reason.cause, "inactivity");
+  cancellation.dispose();
+});
+
+test("resets the inactivity deadline when the provider reports activity", async () => {
+  const cancellation = createRunCancellation(100, new EventEmitter());
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  cancellation.onActivity();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(cancellation.signal.aborted, false);
   cancellation.dispose();
 });
 
