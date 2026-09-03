@@ -27,7 +27,9 @@ import type { Provider } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
+import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
+import { resolveTask } from "./task.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
 
@@ -146,6 +148,9 @@ test("loads the bundled test-writer agent", () => {
   const agent = loadAgent("/not-a-repository", "test-writer");
 
   assert.equal(agent.source, "bundled");
+  assert.equal(agent.description, "Add tests for an existing implementation.");
+  assert.equal(agent.provider, "muse");
+  assert.equal(agent.approvalMode, "approveForMe");
   assert.match(agent.instructions, /Write tests for the behaviour described in the task\./);
 });
 
@@ -153,7 +158,10 @@ test("uses a project agent before its bundled counterpart", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
   mkdirSync(join(repository, ".codex-agents"));
-  writeFileSync(join(repository, ".codex-agents", "test-writer.md"), "Project instructions\n");
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\n---\nProject instructions\n",
+  );
 
   const agent = loadAgent(repository, "test-writer");
 
@@ -161,20 +169,161 @@ test("uses a project agent before its bundled counterpart", (context) => {
   assert.equal(agent.instructions, "Project instructions");
 });
 
-test("uses a generic role prompt for an unknown agent", () => {
-  const agent = loadAgent("/not-a-repository", "reviewer");
-
-  assert.equal(agent.source, "generic");
-  assert.equal(agent.instructions, "You are acting as the reviewer agent. Complete the task carefully.");
+test("rejects an unknown agent profile", () => {
+  assert.throws(() => loadAgent("/not-a-repository", "reviewer"), /Agent profile not found: reviewer/);
 });
 
-test("cancels a run when its timeout elapses", async () => {
+test("rejects output metadata until the wrapper uses it", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\nmode: write\n---\nProject instructions\n",
+  );
+
+  assert.throws(() => loadAgent(repository, "test-writer"), /unknown front matter key: mode/);
+});
+
+test("rejects agent profiles whose name does not match their filename", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: another-agent\ndescription: Project test instructions.\n---\nProject instructions\n",
+  );
+
+  assert.throws(() => loadAgent(repository, "test-writer"), /name must match the requested agent: test-writer/);
+});
+
+test("rejects agent profiles with an unsupported provider", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\nprovider: other\n---\nProject instructions\n",
+  );
+
+  assert.throws(() => loadAgent(repository, "test-writer"), /provider is unsupported: other/);
+});
+
+test("accepts Codex approval modes and rejects Muse mode names", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  const profilePath = join(repository, ".codex-agents", "test-writer.md");
+  writeFileSync(
+    profilePath,
+    "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: alwaysAsk\n---\nProject instructions\n",
+  );
+
+  assert.equal(loadAgent(repository, "test-writer").approvalMode, "alwaysAsk");
+
+  writeFileSync(
+    profilePath,
+    "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: denyUnmatched\n---\nProject instructions\n",
+  );
+
+  assert.throws(() => loadAgent(repository, "test-writer"), /approvalMode must be one of: alwaysAsk, approveForMe, fullAccess/);
+});
+
+test("resolves repository configuration with CLI and profile precedence", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  writeFileSync(
+    join(repository, ".codex-delegate.yml"),
+    [
+      "defaultProvider: muse",
+      "inactivityTimeout: 45s",
+      "snapshot:",
+      "  includeUntracked: false",
+      "  maxFiles: 7",
+      "  maxBytes: 4096",
+      "muse:",
+      "  binary: configured-muse",
+      "  model: configured-model",
+      "  approvalMode: alwaysAsk",
+      "",
+    ].join("\n"),
+  );
+
+  const profile = {
+    approvalMode: "approveForMe" as const,
+    description: "Profile instructions.",
+    instructions: "Do the task.",
+    model: "profile-model",
+    name: "test-writer",
+    provider: "muse",
+    source: "project" as const,
+  };
+  const configured = resolveRunConfiguration(repository, profile);
+  const overridden = resolveRunConfiguration(repository, profile, {
+    approvalMode: "alwaysAsk",
+    model: "cli-model",
+    provider: "muse",
+    timeoutMs: parseInactivityTimeout("2m"),
+  });
+
+  assert.deepEqual(configured, {
+    inactivityTimeoutMs: 45_000,
+    muse: {
+      approvalMode: "approveForMe",
+      binary: "configured-muse",
+      model: "profile-model",
+    },
+    provider: "muse",
+    snapshotLimits: {
+      includeUntracked: false,
+      maxBytes: 4096,
+      maxFiles: 7,
+    },
+  });
+  assert.equal(overridden.inactivityTimeoutMs, 120_000);
+  assert.equal(overridden.muse.approvalMode, "alwaysAsk");
+  assert.equal(overridden.muse.model, "cli-model");
+});
+
+test("rejects invalid configuration and unguarded full access", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  const profile = {
+    description: "Profile instructions.",
+    instructions: "Do the task.",
+    name: "test-writer",
+    source: "project" as const,
+  };
+
+  assert.throws(
+    () => resolveRunConfiguration(repository, profile, { approvalMode: "fullAccess" }),
+    /approvalMode=fullAccess requires --allow-all/,
+  );
+  assert.throws(() => parseInactivityTimeout("20"), /positive duration/);
+
+  writeFileSync(join(repository, ".codex-delegate.yml"), "unknown: value\n");
+
+  assert.throws(() => resolveRunConfiguration(repository, profile), /unknown root key: unknown/);
+});
+
+test("cancels a run after its inactivity deadline elapses", async () => {
   const cancellation = createRunCancellation(1, new EventEmitter());
+  cancellation.onActivity();
 
   await new Promise<void>((resolve) => cancellation.signal.addEventListener("abort", () => resolve(), { once: true }));
 
   assert.equal(cancellation.signal.reason instanceof RunCancelledError, true);
-  assert.equal(cancellation.signal.reason.cause, "timeout");
+  assert.equal(cancellation.signal.reason.cause, "inactivity");
+  cancellation.dispose();
+});
+
+test("resets the inactivity deadline when the provider reports activity", async () => {
+  const cancellation = createRunCancellation(100, new EventEmitter());
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  cancellation.onActivity();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(cancellation.signal.aborted, false);
   cancellation.dispose();
 });
 
@@ -206,14 +355,86 @@ test("rejects providers other than Muse", (context) => {
   assert.equal(output.stderr, "");
 });
 
-test("requires one non-empty positional task", (context) => {
+test("requires one non-empty task source", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
 
   const result = runCli(repository, "run", "--provider", "muse");
 
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /error: missing required argument 'task'/);
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Supply a task as a positional argument, --task file, or stdin/);
+});
+
+test("resolves positional, file, and stdin task input", (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  const taskPath = join(directory, "task.md");
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+  writeFileSync(taskPath, "A task from a file.\n");
+
+  assert.deepEqual(
+    resolveTask({
+      agent: "custom-agent",
+      positional: "A positional task.",
+      stdin: { isTTY: true, read: () => Buffer.alloc(0) },
+    }),
+    { agent: "custom-agent", task: "A positional task." },
+  );
+  assert.deepEqual(
+    resolveTask({
+      positional: "custom-agent",
+      stdin: { isTTY: true, read: () => Buffer.alloc(0) },
+      taskPath,
+    }),
+    { agent: "custom-agent", task: "A task from a file.\n" },
+  );
+  assert.deepEqual(
+    resolveTask({
+      positional: "custom-agent",
+      stdin: { isTTY: false, read: () => Buffer.from("A task from stdin.\n") },
+    }),
+    { agent: "custom-agent", task: "A task from stdin.\n" },
+  );
+});
+
+test("rejects ambiguous, empty, and invalid task sources", () => {
+  const terminal = { isTTY: true, read: () => Buffer.alloc(0) };
+  const pipe = { isTTY: false, read: () => Buffer.from("A task from stdin.\n") };
+
+  assert.throws(
+    () => resolveTask({ positional: "task", stdin: pipe, taskPath: "task.md" }),
+    /either --task or stdin, not both/,
+  );
+  assert.throws(
+    () => resolveTask({ agent: "agent", positional: "task", stdin: pipe }),
+    /only one positional agent name/,
+  );
+  assert.throws(
+    () => resolveTask({ positional: "   ", stdin: terminal }),
+    /must be non-empty/,
+  );
+  assert.throws(
+    () => resolveTask({ positional: "agent", stdin: { isTTY: false, read: () => Buffer.from([0xff]) } }),
+    /not valid UTF-8/,
+  );
+});
+
+test("accepts file and stdin task input before repository discovery", (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  const taskPath = join(directory, "task.md");
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+  writeFileSync(taskPath, "A task from a file.\n");
+
+  const fileResult = runCli(directory, "run", "test-writer", "--task", taskPath, "--provider", "muse");
+  const stdinResult = spawnSync(process.execPath, [cliPath, "run", "test-writer", "--provider", "muse"], {
+    cwd: directory,
+    encoding: "utf8",
+    input: "A task from stdin.\n",
+  });
+
+  assert.equal(fileResult.status, 5);
+  assert.match(fileResult.stderr, /Run codex-delegate from inside a non-bare Git worktree/);
+  assert.equal(stdinResult.status, 5);
+  assert.match(stdinResult.stderr, /Run codex-delegate from inside a non-bare Git worktree/);
 });
 
 test("discovers the Git root from a nested directory", (context) => {
@@ -378,6 +599,24 @@ test("copies non-ignored untracked files and safe symlinks into the worker", (co
   assert.equal(readlinkSync(join(worktree, "included-link")), "nested/included.txt");
   assert.equal(existsSync(join(worktree, "ignored.txt")), false);
   assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("can exclude untracked files from a worker snapshot", (context) => {
+  const repositoryRoot = createDirtyRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  createSeededWorktree(repository, worktree, { includeUntracked: false, maxBytes: 52_428_800, maxFiles: 10_000 });
+
+  assert.equal(readFileSync(join(worktree, "README.md"), "utf8"), "Staged and unstaged change\n");
+  assert.equal(existsSync(join(worktree, "untracked.txt")), false);
 });
 
 test("copies an untracked symlink to a tracked file whose name starts with two dots", (context) => {

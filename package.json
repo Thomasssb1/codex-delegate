@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "@muse-code/sdk": "0.1.1",
-    "commander": "^13.1.0"
+    "commander": "^13.1.0",
+    "yaml": "2.7.1"
   },
   "scripts": {
     "build": "tsc --project tsconfig.json",

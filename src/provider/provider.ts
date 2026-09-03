@@ -1,4 +1,5 @@
 export type ProviderRequest = {
+  onActivity?(): void;
   prompt: string;
   signal: AbortSignal;
   workspaceRoot: string;

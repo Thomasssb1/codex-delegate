@@ -1,6 +1,13 @@
 import { MuseClient } from "@muse-code/sdk";
+import { toMuseApprovalMode, type ApprovalMode } from "../approval-mode.js";
 import { rejectCancelledRun, RunCancelledError } from "../cancellation.js";
 import { ProviderRunError, type Provider, type ProviderRequest, type ProviderResult } from "./provider.js";
+
+export type MuseProviderOptions = {
+  approvalMode: ApprovalMode;
+  binary: string;
+  model?: string;
+};
 
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Muse run was aborted.");
@@ -37,6 +44,13 @@ function waitForClient(clientPromise: Promise<MuseClient>, signal: AbortSignal):
 }
 
 export class MuseProvider implements Provider {
+  constructor(
+    private readonly options: MuseProviderOptions = {
+      approvalMode: "approveForMe",
+      binary: "muse",
+    },
+  ) {}
+
   async run(request: ProviderRequest): Promise<ProviderResult> {
     const stderr: string[] = [];
 
@@ -62,8 +76,11 @@ export class MuseProvider implements Provider {
       },
       cwd: request.workspaceRoot,
       env: process.env,
-      museBin: "muse",
-      onStderr: (chunk) => stderr.push(chunk),
+      museBin: this.options.binary,
+      onStderr: (chunk) => {
+        stderr.push(chunk);
+        request.onActivity?.();
+      },
     });
     const client = await waitForClient(clientPromise, request.signal);
 
@@ -83,21 +100,26 @@ export class MuseProvider implements Provider {
     try {
       rejectCancelledRun(request.signal);
       const session = await client.startSession({
-        approvalMode: "denyUnmatched",
+        approvalMode: toMuseApprovalMode(this.options.approvalMode),
+        modelId: this.options.model,
         workspaceRoot: request.workspaceRoot,
       });
+      request.onActivity?.();
       const turn = await session.sendUserTurn({
         input: [{ text: request.prompt, type: "text" }],
       });
+      request.onActivity?.();
       const responses = new Map<string, string>();
 
       for await (const item of turn.items()) {
+        request.onActivity?.();
         if (item.kind === "agentMessage" && typeof item.text === "string") {
           responses.set(item.itemId, item.text);
         }
       }
 
       const outcome = await turn.completed;
+      request.onActivity?.();
 
       rejectCancelledRun(request.signal);
 

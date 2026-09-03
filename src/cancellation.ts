@@ -1,10 +1,10 @@
-export const DEFAULT_RUN_TIMEOUT_MS = 20 * 60 * 1000;
+export const DEFAULT_INACTIVITY_TIMEOUT_MS = 20 * 60 * 1000;
 
 export class RunCancelledError extends Error {
   constructor(
-    readonly cause: "signal" | "timeout",
+    readonly cause: "inactivity" | "signal",
   ) {
-    super(cause === "timeout" ? "The run timed out." : "The run was interrupted.");
+    super(cause === "inactivity" ? "The provider stopped reporting activity." : "The run was interrupted.");
     this.name = "RunCancelledError";
   }
 }
@@ -16,16 +16,21 @@ type SignalEmitter = {
 
 export type RunCancellation = {
   dispose(): void;
+  onActivity(): void;
   signal: AbortSignal;
 };
 
 export function createRunCancellation(
-  timeoutMs = DEFAULT_RUN_TIMEOUT_MS,
+  inactivityTimeoutMs = DEFAULT_INACTIVITY_TIMEOUT_MS,
   signalEmitter: SignalEmitter = process,
 ): RunCancellation {
   const controller = new AbortController();
   const interrupt = () => controller.abort(new RunCancelledError("signal"));
-  const timeout = setTimeout(() => controller.abort(new RunCancelledError("timeout")), timeoutMs);
+  let timeout: NodeJS.Timeout | undefined;
+  const onActivity = () => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => controller.abort(new RunCancelledError("inactivity")), inactivityTimeoutMs);
+  };
 
   signalEmitter.once("SIGINT", interrupt);
 
@@ -34,6 +39,7 @@ export function createRunCancellation(
       clearTimeout(timeout);
       signalEmitter.off("SIGINT", interrupt);
     },
+    onActivity,
     signal: controller.signal,
   };
 }
