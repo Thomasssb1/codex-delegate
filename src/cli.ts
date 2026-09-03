@@ -5,8 +5,10 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { approvalModes, type ApprovalMode } from "./approval-mode.js";
 import { loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
+import { ConfigurationError, parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { delegate } from "./delegate.js";
 import { loadAcceptedProviders } from "./providers.js";
 import { MuseProvider } from "./provider/muse.js";
@@ -37,6 +39,22 @@ function parseProvider(value: string): Provider {
   }
 
   return value;
+}
+
+function parseApprovalMode(value: string): ApprovalMode {
+  if (!approvalModes.includes(value as ApprovalMode)) {
+    throw new InvalidArgumentError(`Unsupported approval mode: ${value}. Supported modes: ${approvalModes.join(", ")}.`);
+  }
+
+  return value as ApprovalMode;
+}
+
+function parseTimeout(value: string): number {
+  try {
+    return parseInactivityTimeout(value);
+  } catch (error) {
+    throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+  }
 }
 
 function discoverRunRepository(): Repository {
@@ -77,10 +95,26 @@ program
   .showHelpAfterError()
   .command("run [task-or-agent] [agent]")
   .description("Delegate a task to an agent.")
-  .requiredOption("--provider <provider>", "Provider to use.", parseProvider)
+  .option("--provider <provider>", "Override the profile and repository provider.", parseProvider)
   .option("--task <path>", "Read the task from a UTF-8 file.")
+  .option("--timeout <duration>", "Abort after this much provider inactivity.", parseTimeout)
+  .option("--approval-mode <mode>", "Select alwaysAsk, approveForMe, or fullAccess.", parseApprovalMode)
+  .option("--allow-all", "Required with approval mode fullAccess.")
+  .option("--model <name>", "Ask the provider for a specific model.")
   .allowExcessArguments(false)
-  .action(async (taskOrAgent: string | undefined, positionalAgent: string | undefined, options: { task?: string }) => {
+  .action(
+    async (
+      taskOrAgent: string | undefined,
+      positionalAgent: string | undefined,
+      options: {
+        allowAll?: boolean;
+        approvalMode?: ApprovalMode;
+        model?: string;
+        provider?: Provider;
+        task?: string;
+        timeout?: number;
+      },
+    ) => {
     let cancellation: ReturnType<typeof createRunCancellation> | undefined;
 
     try {
@@ -103,14 +137,28 @@ program
         throw new CliError(errorMessage(error), 2);
       }
 
+      let configuration;
+      try {
+        configuration = resolveRunConfiguration(repository.root, profile, {
+          allowAll: options.allowAll,
+          approvalMode: options.approvalMode,
+          model: options.model,
+          provider: options.provider,
+          timeoutMs: options.timeout,
+        });
+      } catch (error) {
+        throw new CliError(errorMessage(error), error instanceof ConfigurationError ? 2 : 1);
+      }
+
       const worktree = join(tmpdir(), `codex-delegate-${randomUUID()}`);
-      cancellation = createRunCancellation();
+      cancellation = createRunCancellation(configuration.inactivityTimeoutMs);
       const result = await delegate({
         onActivity: cancellation.onActivity,
         prompt: createPrompt(profile.instructions, task),
-        provider: new MuseProvider(),
+        provider: new MuseProvider(configuration.muse),
         repository,
         signal: cancellation.signal,
+        snapshotLimits: configuration.snapshotLimits,
         worktree,
       });
 
@@ -130,7 +178,8 @@ program
     } finally {
       cancellation?.dispose();
     }
-  });
+    },
+  );
 
 program.parseAsync().catch((error: unknown) => {
   const runResult = createFailedRunResult(errorMessage(error));

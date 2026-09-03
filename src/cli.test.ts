@@ -27,6 +27,7 @@ import type { Provider } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
+import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
 import { resolveTask } from "./task.js";
 
@@ -226,6 +227,83 @@ test("accepts Codex approval modes and rejects Muse mode names", (context) => {
   );
 
   assert.throws(() => loadAgent(repository, "test-writer"), /approvalMode must be one of: alwaysAsk, approveForMe, fullAccess/);
+});
+
+test("resolves repository configuration with CLI and profile precedence", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  writeFileSync(
+    join(repository, ".codex-delegate.yml"),
+    [
+      "defaultProvider: muse",
+      "inactivityTimeout: 45s",
+      "snapshot:",
+      "  includeUntracked: false",
+      "  maxFiles: 7",
+      "  maxBytes: 4096",
+      "muse:",
+      "  binary: configured-muse",
+      "  model: configured-model",
+      "  approvalMode: alwaysAsk",
+      "",
+    ].join("\n"),
+  );
+
+  const profile = {
+    approvalMode: "approveForMe" as const,
+    description: "Profile instructions.",
+    instructions: "Do the task.",
+    model: "profile-model",
+    name: "test-writer",
+    provider: "muse",
+    source: "project" as const,
+  };
+  const configured = resolveRunConfiguration(repository, profile);
+  const overridden = resolveRunConfiguration(repository, profile, {
+    approvalMode: "alwaysAsk",
+    model: "cli-model",
+    provider: "muse",
+    timeoutMs: parseInactivityTimeout("2m"),
+  });
+
+  assert.deepEqual(configured, {
+    inactivityTimeoutMs: 45_000,
+    muse: {
+      approvalMode: "approveForMe",
+      binary: "configured-muse",
+      model: "profile-model",
+    },
+    provider: "muse",
+    snapshotLimits: {
+      includeUntracked: false,
+      maxBytes: 4096,
+      maxFiles: 7,
+    },
+  });
+  assert.equal(overridden.inactivityTimeoutMs, 120_000);
+  assert.equal(overridden.muse.approvalMode, "alwaysAsk");
+  assert.equal(overridden.muse.model, "cli-model");
+});
+
+test("rejects invalid configuration and unguarded full access", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  const profile = {
+    description: "Profile instructions.",
+    instructions: "Do the task.",
+    name: "test-writer",
+    source: "project" as const,
+  };
+
+  assert.throws(
+    () => resolveRunConfiguration(repository, profile, { approvalMode: "fullAccess" }),
+    /approvalMode=fullAccess requires --allow-all/,
+  );
+  assert.throws(() => parseInactivityTimeout("20"), /positive duration/);
+
+  writeFileSync(join(repository, ".codex-delegate.yml"), "unknown: value\n");
+
+  assert.throws(() => resolveRunConfiguration(repository, profile), /unknown root key: unknown/);
 });
 
 test("cancels a run after its inactivity deadline elapses", async () => {
@@ -521,6 +599,24 @@ test("copies non-ignored untracked files and safe symlinks into the worker", (co
   assert.equal(readlinkSync(join(worktree, "included-link")), "nested/included.txt");
   assert.equal(existsSync(join(worktree, "ignored.txt")), false);
   assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("can exclude untracked files from a worker snapshot", (context) => {
+  const repositoryRoot = createDirtyRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  createSeededWorktree(repository, worktree, { includeUntracked: false, maxBytes: 52_428_800, maxFiles: 10_000 });
+
+  assert.equal(readFileSync(join(worktree, "README.md"), "utf8"), "Staged and unstaged change\n");
+  assert.equal(existsSync(join(worktree, "untracked.txt")), false);
 });
 
 test("copies an untracked symlink to a tracked file whose name starts with two dots", (context) => {

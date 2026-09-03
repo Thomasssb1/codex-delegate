@@ -13,6 +13,10 @@ export type SnapshotLimits = {
   maxFiles: number;
 };
 
+export type SnapshotOptions = SnapshotLimits & {
+  includeUntracked?: boolean;
+};
+
 export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
   maxBytes: 52_428_800,
   maxFiles: 10_000,
@@ -63,7 +67,7 @@ function resolveRepositoryPath(root: string, path: string): string {
 }
 
 function validateSnapshotLimits(limits: SnapshotLimits): void {
-  for (const [name, value] of Object.entries(limits)) {
+  for (const [name, value] of Object.entries({ maxBytes: limits.maxBytes, maxFiles: limits.maxFiles })) {
     if (!Number.isSafeInteger(value) || value < 0) {
       throw new Error(`Snapshot limit ${name} must be a non-negative safe integer.`);
     }
@@ -168,14 +172,14 @@ export function collectWorktreeChanges(worktree: string, baseline: string): {
 export function createSeededWorktree(
   repository: Repository,
   worktree: string,
-  limits: SnapshotLimits = DEFAULT_SNAPSHOT_LIMITS,
+  limits: SnapshotOptions = DEFAULT_SNAPSHOT_LIMITS,
 ): WorkerSnapshot {
   if (existsSync(worktree)) {
     throw new Error(`The worktree path already exists: ${worktree}`);
   }
 
   const trackedChanges = runGit(repository.root, ["diff", "--binary", repository.head]);
-  const untrackedFiles = collectUntrackedFiles(repository, limits);
+  const untrackedFiles = limits.includeUntracked === false ? [] : collectUntrackedFiles(repository, limits);
   runGit(repository.root, [
     "worktree",
     "add",

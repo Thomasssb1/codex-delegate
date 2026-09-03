@@ -1,11 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseDocument } from "yaml";
+import { approvalModes, type ApprovalMode } from "../approval-mode.js";
 import { loadAcceptedProviders } from "../providers.js";
 
 const agentNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const acceptedProviders = new Set(loadAcceptedProviders());
-const approvalModes = ["alwaysAsk", "approveForMe", "fullAccess"] as const;
 const profileKeys = new Set([
   "approvalMode",
   "description",
@@ -15,7 +15,7 @@ const profileKeys = new Set([
 ]);
 
 export type AgentProfile = {
-  approvalMode?: (typeof approvalModes)[number];
+  approvalMode?: ApprovalMode;
   description: string;
   instructions: string;
   model?: string;
