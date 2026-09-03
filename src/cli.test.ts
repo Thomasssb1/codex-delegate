@@ -179,6 +179,10 @@ test("installs the bundled Codex skills", (context) => {
     readFileSync(join(codexHome, "skills", "codex-delegate-test", "SKILL.md"), "utf8"),
     /Use the `codex-delegate` skill to list agents/,
   );
+  assert.match(
+    readFileSync(join(codexHome, "skills", "codex-delegate", "SKILL.md"), "utf8"),
+    /`command -v codex-delegate`/,
+  );
   assert.throws(() => installCodexSkills({ codexHome }), /Codex skills already installed/);
 
   writeFileSync(join(codexHome, "skills", "codex-delegate", "SKILL.md"), "outdated instructions\n");
