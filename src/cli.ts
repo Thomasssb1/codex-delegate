@@ -15,6 +15,7 @@ import { MuseProvider } from "./provider/muse.js";
 import { ProviderRunError } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { discoverRepository, type Repository } from "./repository.js";
+import { isNestedRun, nestedRunRefusal } from "./nesting.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
 import { resolveTask, TaskSourceError } from "./task.js";
 import { createInteractionResponder } from "./interaction.js";
@@ -139,6 +140,7 @@ program
   .option("--timeout <duration>", "Abort after this much provider inactivity.", parseTimeout)
   .option("--approval-mode <mode>", "Select alwaysAsk, approveForMe, denyUnmatched, or fullAccess.", parseApprovalMode)
   .option("--allow-all", "Required with approval mode fullAccess.")
+  .option("--allow-nested", "Allow this run inside a delegated worker (overrides the nesting guard).")
   .option("--model <name>", "Ask the provider for a specific model.")
   .allowExcessArguments(false)
   .action(
@@ -147,6 +149,7 @@ program
       positionalAgent: string | undefined,
       options: {
         allowAll?: boolean;
+        allowNested?: boolean;
         approvalMode?: ApprovalMode;
         model?: string;
         provider?: Provider;
@@ -158,6 +161,10 @@ program
     let interactions: ReturnType<typeof createInteractionResponder> | undefined;
 
     try {
+      if (options.allowNested !== true && isNestedRun()) {
+        throw new CliError(nestedRunRefusal(), 2);
+      }
+
       const { agent, task } = resolveTask({
         agent: positionalAgent,
         positional: taskOrAgent,

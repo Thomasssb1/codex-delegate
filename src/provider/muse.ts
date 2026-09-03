@@ -1,6 +1,7 @@
 import { readSessionDurability, Session, spawnMspConnection, type SpawnedMspConnection } from "@muse-code/sdk";
 import { toMuseApprovalMode, type ApprovalMode } from "../approval-mode.js";
 import { rejectCancelledRun, RunCancelledError } from "../cancellation.js";
+import { nestedWorkerEnv } from "../nesting.js";
 import {
   ProviderRunError,
   type ApprovalRequest,
@@ -44,6 +45,29 @@ export function museFailureMessage(outcome: MuseTurnOutcome): string {
 
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Muse run was aborted.");
+}
+
+const AUTH_FILE_READ_ERROR = /failed to read auth file/i;
+const AUTH_FILE_ACCESS_BLOCKED = /operation not permitted|permission denied|\bEPERM\b|\bEACCES\b/i;
+const AUTH_FILE_MISSING = /no such file or directory|\bENOENT\b/i;
+
+export function museAuthFailureMessage(stderr: string): string | undefined {
+  if (!AUTH_FILE_READ_ERROR.test(stderr)) {
+    return undefined;
+  }
+
+  if (AUTH_FILE_ACCESS_BLOCKED.test(stderr)) {
+    return (
+      "Muse credentials could not be read in this environment (auth file access was blocked). " +
+      "Run unsandboxed or allow access to the Muse config directory, then retry."
+    );
+  }
+
+  if (AUTH_FILE_MISSING.test(stderr)) {
+    return "Muse is not authenticated in this environment (no auth file found). Run `muse login` or set META_API_KEY, then retry.";
+  }
+
+  return "Muse could not read its credentials in this environment. Run `muse login` or set META_API_KEY, then retry.";
 }
 
 function waitForConnection(connectionPromise: Promise<SpawnedMspConnection>, signal: AbortSignal): Promise<SpawnedMspConnection> {
@@ -172,7 +196,12 @@ export class MuseProvider implements Provider {
       }
 
       rejectCancelledRun(request.signal);
-      throw new ProviderRunError(error instanceof Error ? error.message : String(error), stderr.join(""), { cause: error });
+      const collectedStderr = stderr.join("");
+      throw new ProviderRunError(
+        museAuthFailureMessage(collectedStderr) ?? (error instanceof Error ? error.message : String(error)),
+        collectedStderr,
+        { cause: error },
+      );
     }
   }
 
@@ -182,7 +211,7 @@ export class MuseProvider implements Provider {
       args: ["serve"],
       command: this.options.binary,
       cwd: request.workspaceRoot,
-      env: process.env,
+      env: nestedWorkerEnv(),
       onStderr: (chunk) => {
         stderr.push(chunk);
         request.onActivity?.();

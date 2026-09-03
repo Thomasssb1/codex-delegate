@@ -22,17 +22,24 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadAcceptedProviders } from "./providers.js";
 import { discoverRepository } from "./repository.js";
-import { createSeededWorktree, removeWorktree } from "./worktree.js";
+import { DEFAULT_SNAPSHOT_LIMITS, createSeededWorktree, removeWorktree } from "./worktree.js";
 import { delegate } from "./delegate.js";
 import type { Provider } from "./provider/provider.js";
+import { ProviderRunError } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { listAgents, loadAgent } from "./agents/loader.js";
-import { createRunCancellation, RunCancelledError } from "./cancellation.js";
+import {
+  DEFAULT_INACTIVITY_TIMEOUT_MS,
+  createRunCancellation,
+  rejectCancelledRun,
+  RunCancelledError,
+} from "./cancellation.js";
 import { createInteractionResponder } from "./interaction.js";
 import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
+import { NESTING_ENV_VAR, isNestedRun, nestedRunRefusal, nestedWorkerEnv } from "./nesting.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
-import { museFailureMessage, MuseProvider } from "./provider/muse.js";
+import { museAuthFailureMessage, museFailureMessage, MuseProvider } from "./provider/muse.js";
 import { resolveTask } from "./task.js";
 import { installCodexSkills } from "./codex-skills.js";
 
@@ -1235,4 +1242,525 @@ test("rejects a directory outside a Git repository", (context) => {
 
   assert.equal(result.status, 5);
   assert.match(result.stderr, /Run codex-delegate from inside a non-bare Git worktree\./);
+});
+
+test("maps every Codex approval mode to its Muse counterpart", () => {
+  assert.equal(toMuseApprovalMode("alwaysAsk"), "onRequest");
+  assert.equal(toMuseApprovalMode("approveForMe"), "promptUnmatched");
+  assert.equal(toMuseApprovalMode("denyUnmatched"), "denyUnmatched");
+  assert.equal(toMuseApprovalMode("fullAccess"), "allowAll");
+});
+
+test("parses millisecond, second, minute and hour inactivity timeouts", () => {
+  assert.equal(parseInactivityTimeout("500ms"), 500);
+  assert.equal(parseInactivityTimeout("30s"), 30_000);
+  assert.equal(parseInactivityTimeout("20m"), 1_200_000);
+  assert.equal(parseInactivityTimeout("1h"), 3_600_000);
+  assert.throws(() => parseInactivityTimeout("0s"), /positive safe duration/);
+  assert.throws(() => parseInactivityTimeout("20"), /positive duration/);
+  assert.throws(() => parseInactivityTimeout("10d"), /positive duration/);
+});
+
+test("falls back to default run configuration without a repository config file", () => {
+  const configuration = resolveRunConfiguration("/not-a-repository", {
+    description: "Profile instructions.",
+    instructions: "Do the task.",
+    name: "test-writer",
+    source: "project",
+  });
+
+  assert.deepEqual(configuration, {
+    inactivityTimeoutMs: DEFAULT_INACTIVITY_TIMEOUT_MS,
+    muse: {
+      approvalMode: "approveForMe",
+      binary: "muse",
+      model: undefined,
+    },
+    provider: "muse",
+    snapshotLimits: {
+      includeUntracked: undefined,
+      maxBytes: DEFAULT_SNAPSHOT_LIMITS.maxBytes,
+      maxFiles: DEFAULT_SNAPSHOT_LIMITS.maxFiles,
+    },
+  });
+});
+
+test("rejects --allow-all unless approval mode is fullAccess", () => {
+  const repository = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  try {
+    assert.throws(
+      () =>
+        resolveRunConfiguration(
+          repository,
+          { description: "d", instructions: "i", name: "test-writer", source: "project" },
+          { allowAll: true, approvalMode: "approveForMe" },
+        ),
+      /--allow-all can only be used with approvalMode=fullAccess/,
+    );
+  } finally {
+    rmSync(repository, { force: true, recursive: true });
+  }
+});
+
+test("rejects invalid repository configuration values", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  const profile = { description: "d", instructions: "i", name: "test-writer", source: "project" as const };
+
+  writeFileSync(join(repository, ".codex-delegate.yml"), "snapshot:\n  unknownKey: 1\n");
+  assert.throws(() => resolveRunConfiguration(repository, profile), /unknown snapshot key: unknownKey/);
+
+  writeFileSync(join(repository, ".codex-delegate.yml"), "snapshot:\n  maxFiles: -1\n");
+  assert.throws(() => resolveRunConfiguration(repository, profile), /snapshot\.maxFiles must be a non-negative safe integer/);
+
+  writeFileSync(join(repository, ".codex-delegate.yml"), "muse:\n  approvalMode: sometimes\n");
+  assert.throws(() => resolveRunConfiguration(repository, profile), /muse\.approvalMode must be one of/);
+
+  writeFileSync(join(repository, ".codex-delegate.yml"), "defaultProvider: other\n");
+  assert.throws(() => resolveRunConfiguration(repository, profile), /defaultProvider is unsupported: other/);
+
+  writeFileSync(join(repository, ".codex-delegate.yml"), "inactivityTimeout: 10d\n");
+  assert.throws(() => resolveRunConfiguration(repository, profile), /Timeout must be a positive duration/);
+});
+
+test("rejects repository configuration that is not a mapping", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  const profile = { description: "d", instructions: "i", name: "test-writer", source: "project" as const };
+
+  writeFileSync(join(repository, ".codex-delegate.yml"), "- just\n- a\n- list\n");
+  assert.throws(() => resolveRunConfiguration(repository, profile), /root must be a mapping/);
+});
+
+test("throws when discovering a repository outside Git", (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+
+  assert.throws(() => discoverRepository(directory), /Run codex-delegate from inside a non-bare Git worktree/);
+});
+
+test("defaults to the test-writer agent for file task input without a positional name", (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+  const taskPath = join(directory, "task.md");
+  writeFileSync(taskPath, "A task from a file.\n");
+
+  assert.deepEqual(resolveTask({ taskPath }), { agent: "test-writer", task: "A task from a file.\n" });
+});
+
+test("rejects missing, empty and non-UTF8 task files", (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+
+  assert.throws(
+    () => resolveTask({ positional: "test-writer", taskPath: join(directory, "missing.md") }),
+    /Could not read task file/,
+  );
+
+  const emptyPath = join(directory, "empty.md");
+  writeFileSync(emptyPath, "   \n");
+  assert.throws(() => resolveTask({ positional: "test-writer", taskPath: emptyPath }), /must be non-empty/);
+
+  const binaryPath = join(directory, "binary.md");
+  writeFileSync(binaryPath, Buffer.from([0xff, 0xfe, 0x00]));
+  assert.throws(() => resolveTask({ positional: "test-writer", taskPath: binaryPath }), /not valid UTF-8/);
+});
+
+test("rejects an empty agent name for positional and file tasks", () => {
+  assert.throws(() => resolveTask({ positional: "   " }), /must be non-empty/);
+  assert.throws(() => resolveTask({ agent: "  ", positional: "A task." }), /agent name must be non-empty/);
+});
+
+test("keeps the checkout guard in every delegated prompt", () => {
+  const prompt = createPrompt("Do the thing.", "The task.");
+
+  assert.match(prompt, /Work only in the current checkout\. Do not commit or modify \.git\./);
+});
+
+test("explains Muse terminal failures with reason and fallback messages", () => {
+  assert.equal(
+    museFailureMessage({ kind: "completed", params: { reason: "turn ended early", terminal: "failed" } }),
+    "Muse did not complete the turn successfully: turn ended early",
+  );
+  assert.equal(museFailureMessage({ kind: "completed", params: { terminal: "completed" } }), "Muse did not complete the turn successfully.");
+  assert.equal(museFailureMessage({ kind: "aborted" }), "Muse did not complete the turn successfully.");
+});
+
+test("wraps unexpected Muse failures in ProviderRunError while preserving cancellation", async () => {
+  const controller = new AbortController();
+  const provider = new MuseProvider();
+  const unsafeProvider = provider as unknown as { runTurn(): Promise<never> };
+  unsafeProvider.runTurn = async () => {
+    throw new Error("Transport boom.");
+  };
+
+  await assert.rejects(
+    provider.run({ prompt: "Do the task.", signal: controller.signal, workspaceRoot: process.cwd() }),
+    (error: unknown) => error instanceof ProviderRunError && error.message === "Transport boom." && error.stderr === "",
+  );
+});
+
+test("throws from rejectCancelledRun only after the signal aborts", () => {
+  const controller = new AbortController();
+
+  assert.doesNotThrow(() => rejectCancelledRun(controller.signal));
+
+  const expected = new RunCancelledError("signal");
+  controller.abort(expected);
+  assert.throws(() => rejectCancelledRun(controller.signal), (error: unknown) => error === expected);
+
+  const genericController = new AbortController();
+  genericController.abort(new Error("generic"));
+  assert.throws(() => rejectCancelledRun(genericController.signal), /generic/);
+});
+
+test("reports distinct messages for inactivity and interruption cancellations", () => {
+  assert.equal(new RunCancelledError("inactivity").message, "The provider stopped reporting activity.");
+  assert.equal(new RunCancelledError("signal").message, "The run was interrupted.");
+});
+
+test("rejects malformed Codex approval replies", async () => {
+  const approval = {
+    approvalId: "approval",
+    choices: [{ choiceId: "allow", decision: "approved", label: "Allow" }],
+    kind: "approval" as const,
+    requirementId: { approvalId: "approval", sourceIndex: 1 },
+    toolName: "shell",
+    turnId: "turn",
+  };
+
+  for (const [line, pattern] of [
+    ["not-json\n", /Codex must reply with a JSON object/],
+    ['"just-a-string"\n', /Codex must reply with a JSON object/],
+    ['{"choiceId":"unknown"}\n', /Codex selected an approval choice Muse did not offer/],
+    ['{"choiceId":"allow","feedback":42}\n', /Codex approval feedback must be a string/],
+  ] as const) {
+    const input = new PassThrough();
+    const responder = createInteractionResponder(input, { write: () => undefined });
+    const pending = responder.request(approval);
+    await new Promise((resolve) => setImmediate(resolve));
+    input.write(line);
+    await assert.rejects(pending, pattern);
+    responder.close();
+  }
+});
+
+test("rejects Codex input replies without an answers array", async () => {
+  const request = {
+    kind: "userInput" as const,
+    questions: [],
+    toolName: "ask_user",
+    turnId: "turn",
+    userInputId: "input",
+  };
+
+  for (const line of ['{"answers":"nope"}\n', '{}\n']) {
+    const input = new PassThrough();
+    const responder = createInteractionResponder(input, { write: () => undefined });
+    const pending = responder.request(request);
+    await new Promise((resolve) => setImmediate(resolve));
+    input.write(line);
+    await assert.rejects(pending, /Codex input answers must be an array/);
+    responder.close();
+  }
+});
+
+test("rejects agent profiles without front matter or instructions", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+
+  writeFileSync(join(repository, ".codex-agents", "test-writer.md"), "No front matter here.\n");
+  assert.throws(() => loadAgent(repository, "test-writer"), /expected YAML front matter delimited by ---/);
+
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\n---\n   \n",
+  );
+  assert.throws(() => loadAgent(repository, "test-writer"), /instructions are empty/);
+});
+
+test("rejects agent profiles with invalid names", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: Bad_Name\ndescription: Project test instructions.\n---\nProject instructions\n",
+  );
+  assert.throws(() => loadAgent(repository, "test-writer"), /name is invalid: Bad_Name/);
+});
+
+test("ignores non-profile files and broken symlinks when listing agents", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(join(repository, ".codex-agents", "notes.txt"), "not an agent\n");
+  mkdirSync(join(repository, ".codex-agents", "directory.md"));
+  symlinkSync(join(repository, "missing-target.md"), join(repository, ".codex-agents", "broken.md"));
+
+  assert.deepEqual(
+    listAgents(repository).map(({ name }) => name),
+    ["reviewer", "test-writer"],
+  );
+});
+
+test("rejects untracked snapshots with negative limits or an existing worktree path", (context) => {
+  const repositoryRoot = createRepository();
+  context.after(() => rmSync(repositoryRoot, { force: true, recursive: true }));
+  const repository = discoverRepository(repositoryRoot);
+  const existingWorktree = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(existingWorktree, { force: true, recursive: true }));
+
+  assert.throws(
+    () => createSeededWorktree(repository, existingWorktree),
+    /The worktree path already exists/,
+  );
+  assert.throws(
+    () =>
+      createSeededWorktree(repository, join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`), {
+        maxBytes: 10,
+        maxFiles: -1,
+      }),
+    /Snapshot limit maxFiles must be a non-negative safe integer/,
+  );
+});
+
+test("rejects absolute untracked symlink targets", (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+  symlinkSync("/etc/passwd", join(repositoryRoot, "absolute-link"));
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  assert.throws(() => createSeededWorktree(repository, worktree), /Unsafe untracked symlink target/);
+  assert.equal(existsSync(worktree), false);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("returns no worker changes when the provider leaves the checkout untouched", async (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => rmSync(repositoryRoot, { force: true, recursive: true }));
+  const provider: Provider = {
+    async run() {
+      return { response: "No changes needed.", stderr: "" };
+    },
+  };
+
+  const result = await delegate({
+    prompt: "Write a test",
+    provider,
+    repository,
+    signal: new AbortController().signal,
+    worktree,
+  });
+
+  assert.deepEqual(result.changedFiles, []);
+  assert.equal(result.patch.length, 0);
+  assert.equal(result.response, "No changes needed.");
+  assert.equal(existsSync(worktree), false);
+});
+
+test("refuses to seed a worker after cancellation without touching Git", async (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => rmSync(repositoryRoot, { force: true, recursive: true }));
+  const sourceState = captureRepositoryState(repositoryRoot);
+  const controller = new AbortController();
+  controller.abort(new RunCancelledError("signal"));
+  const provider: Provider = {
+    async run() {
+      throw new Error("Provider must not run after cancellation.");
+    },
+  };
+
+  await assert.rejects(
+    delegate({ prompt: "Write a test", provider, repository, signal: controller.signal, worktree }),
+    RunCancelledError,
+  );
+  assert.equal(existsSync(worktree), false);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("installs Codex skills through the CLI and refuses without --force", (context) => {
+  const codexHome = mkdtempSync(join(tmpdir(), "codex-home-"));
+  const repository = createRepository();
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  context.after(() => {
+    if (previousCodexHome === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodexHome;
+    }
+    rmSync(codexHome, { force: true, recursive: true });
+    rmSync(repository, { force: true, recursive: true });
+  });
+
+  const first = runCli(repository, "install-skills");
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(first.stdout, /"installed":\["codex-delegate"/);
+
+  const second = runCli(repository, "install-skills");
+  assert.equal(second.status, 2);
+  assert.match(JSON.parse(second.stdout).error as string, /already installed/);
+
+  const forced = runCli(repository, "install-skills", "--force");
+  assert.equal(forced.status, 0, forced.stderr);
+});
+
+test("rejects unknown agents through the run command", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+
+  const result = runCli(repository, "run", "Do the task.", "missing-agent", "--provider", "muse");
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Agent profile not found: missing-agent/);
+  assert.match(JSON.parse(result.stdout).error as string, /Agent profile not found: missing-agent/);
+});
+
+test("rejects invalid timeout and approval-mode flags through the run command", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+
+  const timeoutResult = runCli(repository, "run", "Do the task.", "--timeout", "bogus");
+  assert.notEqual(timeoutResult.status, 0);
+  assert.match(timeoutResult.stderr, /Timeout must be a positive duration/);
+
+  const approvalResult = runCli(repository, "run", "Do the task.", "--approval-mode", "sometimes");
+  assert.notEqual(approvalResult.status, 0);
+  assert.match(approvalResult.stderr, /Unsupported approval mode/);
+});
+
+test("marks worker environments so nested runs refuse by default", () => {
+  const workerEnv = nestedWorkerEnv({ PATH: "/usr/bin" });
+
+  assert.equal(workerEnv[NESTING_ENV_VAR], "1");
+  assert.equal(workerEnv.PATH, "/usr/bin");
+  assert.equal(isNestedRun(workerEnv), true);
+  assert.equal(isNestedRun({}), false);
+  assert.equal(isNestedRun({ [NESTING_ENV_VAR]: "0" }), false);
+  assert.match(nestedRunRefusal(), /--allow-nested/);
+});
+
+test("leaves the parent environment unchanged when marking a worker environment", () => {
+  const parentEnv = { PATH: "/usr/bin" };
+  nestedWorkerEnv(parentEnv);
+
+  assert.deepEqual(parentEnv, { PATH: "/usr/bin" });
+});
+
+test("refuses nested runs without --allow-nested", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  const previousMarker = process.env[NESTING_ENV_VAR];
+  process.env[NESTING_ENV_VAR] = "1";
+  context.after(() => {
+    if (previousMarker === undefined) {
+      delete process.env[NESTING_ENV_VAR];
+    } else {
+      process.env[NESTING_ENV_VAR] = previousMarker;
+    }
+  });
+
+  const result = runCli(repository, "run", "Do the task.", "--provider", "muse");
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /nested delegation is blocked/);
+  assert.match(result.stderr, /--allow-nested/);
+  assert.match(JSON.parse(result.stdout).error as string, /nested delegation is blocked/);
+});
+
+test("allows nested runs with --allow-nested", (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+  const previousMarker = process.env[NESTING_ENV_VAR];
+  process.env[NESTING_ENV_VAR] = "1";
+  context.after(() => {
+    if (previousMarker === undefined) {
+      delete process.env[NESTING_ENV_VAR];
+    } else {
+      process.env[NESTING_ENV_VAR] = previousMarker;
+    }
+  });
+
+  const result = runCli(directory, "run", "Do the task.", "--provider", "muse", "--allow-nested");
+
+  assert.equal(result.status, 5);
+  assert.match(result.stderr, /Run codex-delegate from inside a non-bare Git worktree/);
+});
+
+test("tells delegated workers not to delegate again", () => {
+  for (const name of ["reviewer", "test-writer"]) {
+    assert.match(
+      loadAgent("/not-a-repository", name).instructions,
+      /Do not spawn subagents and do not use any `codex-delegate` skills/,
+    );
+  }
+});
+
+test("explains blocked Muse credential access as an environment problem", async () => {
+  const controller = new AbortController();
+  const provider = new MuseProvider();
+  const unsafeProvider = provider as unknown as { runTurn(request: unknown, stderr: string[]): Promise<never> };
+  unsafeProvider.runTurn = async (_request, stderr) => {
+    stderr.push(
+      "compose serve model client: failed to read auth file at /Users/thoma/.config/muse/auth.json: Operation not permitted (os error 1)\n",
+    );
+    throw new Error("connection reached EOF");
+  };
+
+  await assert.rejects(
+    provider.run({ prompt: "Do the task.", signal: controller.signal, workspaceRoot: process.cwd() }),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderRunError);
+      assert.match(error.message, /could not be read in this environment/);
+      assert.match(error.message, /unsandboxed/);
+      assert.match(error.stderr, /failed to read auth file/);
+      return true;
+    },
+  );
+});
+
+test("explains a missing Muse auth file as missing authentication", () => {
+  const message = museAuthFailureMessage(
+    "compose serve model client: failed to read auth file at /home/user/.config/muse/auth.json: No such file or directory (os error 2)\n",
+  );
+
+  assert.match(message as string, /not authenticated/);
+  assert.match(message as string, /muse login/);
+  assert.match(message as string, /META_API_KEY/);
+});
+
+test("leaves non-auth Muse failures unmapped", async () => {
+  const controller = new AbortController();
+  const provider = new MuseProvider();
+  const unsafeProvider = provider as unknown as { runTurn(request: unknown, stderr: string[]): Promise<never> };
+  unsafeProvider.runTurn = async (_request, stderr) => {
+    stderr.push("transport exploded\n");
+    throw new Error("connection reached EOF");
+  };
+
+  assert.equal(museAuthFailureMessage("transport exploded\n"), undefined);
+
+  await assert.rejects(
+    provider.run({ prompt: "Do the task.", signal: controller.signal, workspaceRoot: process.cwd() }),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderRunError);
+      assert.equal((error as ProviderRunError).message, "connection reached EOF");
+      assert.equal((error as ProviderRunError).stderr, "transport exploded\n");
+      return true;
+    },
+  );
 });

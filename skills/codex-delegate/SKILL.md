@@ -1,9 +1,11 @@
 ---
 name: codex-delegate
-description: Delegate a bounded coding task to an available subagent.
+description: Delegate a bounded coding task to an available subagent. (Codex orchestrator only; delegated workers must not use this skill.)
 ---
 
 Use this skill when another workflow needs an isolated subagent run.
+
+If you are a delegated worker (your task arrived via a `codex-delegate run`), do not use this skill: do the work directly instead of delegating again.
 
 Before invoking the CLI, run `command -v codex-delegate`.
 
