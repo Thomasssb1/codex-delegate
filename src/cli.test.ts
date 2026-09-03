@@ -39,7 +39,7 @@ import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { NESTING_ENV_VAR, isNestedRun, nestedRunRefusal, nestedWorkerEnv } from "./nesting.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
-import { museFailureMessage, MuseProvider } from "./provider/muse.js";
+import { museAuthFailureMessage, museFailureMessage, MuseProvider } from "./provider/muse.js";
 import { resolveTask } from "./task.js";
 import { installCodexSkills } from "./codex-skills.js";
 
@@ -1708,4 +1708,59 @@ test("tells delegated workers not to delegate again", () => {
       /Do not spawn subagents and do not use any `codex-delegate` skills/,
     );
   }
+});
+
+test("explains blocked Muse credential access as an environment problem", async () => {
+  const controller = new AbortController();
+  const provider = new MuseProvider();
+  const unsafeProvider = provider as unknown as { runTurn(request: unknown, stderr: string[]): Promise<never> };
+  unsafeProvider.runTurn = async (_request, stderr) => {
+    stderr.push(
+      "compose serve model client: failed to read auth file at /Users/thoma/.config/muse/auth.json: Operation not permitted (os error 1)\n",
+    );
+    throw new Error("connection reached EOF");
+  };
+
+  await assert.rejects(
+    provider.run({ prompt: "Do the task.", signal: controller.signal, workspaceRoot: process.cwd() }),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderRunError);
+      assert.match(error.message, /could not be read in this environment/);
+      assert.match(error.message, /unsandboxed/);
+      assert.match(error.stderr, /failed to read auth file/);
+      return true;
+    },
+  );
+});
+
+test("explains a missing Muse auth file as missing authentication", () => {
+  const message = museAuthFailureMessage(
+    "compose serve model client: failed to read auth file at /home/user/.config/muse/auth.json: No such file or directory (os error 2)\n",
+  );
+
+  assert.match(message as string, /not authenticated/);
+  assert.match(message as string, /muse login/);
+  assert.match(message as string, /META_API_KEY/);
+});
+
+test("leaves non-auth Muse failures unmapped", async () => {
+  const controller = new AbortController();
+  const provider = new MuseProvider();
+  const unsafeProvider = provider as unknown as { runTurn(request: unknown, stderr: string[]): Promise<never> };
+  unsafeProvider.runTurn = async (_request, stderr) => {
+    stderr.push("transport exploded\n");
+    throw new Error("connection reached EOF");
+  };
+
+  assert.equal(museAuthFailureMessage("transport exploded\n"), undefined);
+
+  await assert.rejects(
+    provider.run({ prompt: "Do the task.", signal: controller.signal, workspaceRoot: process.cwd() }),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderRunError);
+      assert.equal((error as ProviderRunError).message, "connection reached EOF");
+      assert.equal((error as ProviderRunError).stderr, "transport exploded\n");
+      return true;
+    },
+  );
 });
