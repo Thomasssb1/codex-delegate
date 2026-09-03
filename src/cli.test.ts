@@ -183,6 +183,43 @@ test("returns a JSON failure result when repository discovery fails", (context) 
   assert.match(result.stderr, /The Git repository must have a valid HEAD commit\./);
 });
 
+test(
+  "returns a real Muse patch without changing the caller checkout",
+  { skip: process.env.MUSE_E2E !== "1" },
+  (context) => {
+    const repository = createRepository();
+    context.after(() => rmSync(repository, { force: true, recursive: true }));
+    const initialStatus = execFileSync("git", ["status", "--porcelain=v1"], { cwd: repository, encoding: "utf8" });
+
+    const result = runCli(
+      repository,
+      "run",
+      "Add a file named muse-e2e.test.ts containing exactly export {}; followed by a newline.",
+      "e2e",
+      "--provider",
+      "muse",
+      "--json",
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout) as Record<string, unknown>;
+    assert.equal(output.error, undefined);
+    assert.equal(typeof output.response, "string");
+    assert.equal(typeof output.stderr, "string");
+    assert.match(output.patch as string, /muse-e2e\.test\.ts/);
+    assert.equal(
+      execFileSync("git", ["status", "--porcelain=v1"], { cwd: repository, encoding: "utf8" }),
+      initialStatus,
+    );
+    assert.equal(
+      execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repository, encoding: "utf8" })
+        .split("\n")
+        .filter((line) => line.startsWith("worktree ")).length,
+      1,
+    );
+  },
+);
+
 test("accepts uncommitted changes for a later worker snapshot", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
