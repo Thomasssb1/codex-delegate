@@ -1,9 +1,21 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -32,6 +44,58 @@ function createRepository(): string {
   writeFileSync(join(repository, "README.md"), "Initial commit\n");
   runGit(repository, ["add", "README.md"]);
   runGit(repository, ["commit", "--quiet", "-m", "Initial commit"]);
+
+  return repository;
+}
+
+type RepositoryState = {
+  head: string;
+  indexDiff: Buffer;
+  status: string;
+  worktreeDiff: Buffer;
+};
+
+function captureRepositoryState(repository: string): RepositoryState {
+  return {
+    head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" }),
+    indexDiff: execFileSync("git", ["diff", "--cached", "--binary"], { cwd: repository }),
+    status: execFileSync("git", ["status", "--porcelain=v1"], { cwd: repository, encoding: "utf8" }),
+    worktreeDiff: execFileSync("git", ["diff", "--binary"], { cwd: repository }),
+  };
+}
+
+function assertRepositoryState(repository: string, expected: RepositoryState): void {
+  assert.deepEqual(captureRepositoryState(repository), expected);
+}
+
+function createDirtyRepository(): string {
+  const repository = createRepository();
+
+  writeFileSync(join(repository, "README.md"), "Staged change\n");
+  runGit(repository, ["add", "README.md"]);
+  writeFileSync(join(repository, "README.md"), "Staged and unstaged change\n");
+  writeFileSync(join(repository, "untracked.txt"), "Caller change\n");
+
+  return repository;
+}
+
+function createRepositoryWithTrackedChanges(): string {
+  const repository = createRepository();
+
+  writeFileSync(join(repository, "delete.txt"), "Delete me\n");
+  writeFileSync(join(repository, "rename-me.txt"), "Rename me\n");
+  writeFileSync(join(repository, "binary.bin"), Buffer.from([0x00, 0x01, 0x02]));
+  writeFileSync(join(repository, "script.sh"), "#!/bin/sh\necho initial\n");
+  runGit(repository, ["add", "delete.txt", "rename-me.txt", "binary.bin", "script.sh"]);
+  runGit(repository, ["commit", "--quiet", "-m", "Tracked fixture files"]);
+
+  writeFileSync(join(repository, "README.md"), "Staged change\n");
+  runGit(repository, ["add", "README.md"]);
+  writeFileSync(join(repository, "README.md"), "Staged and unstaged change\n");
+  runGit(repository, ["mv", "rename-me.txt", "renamed.txt"]);
+  rmSync(join(repository, "delete.txt"));
+  writeFileSync(join(repository, "binary.bin"), Buffer.from([0x00, 0xff, 0x02]));
+  chmodSync(join(repository, "script.sh"), 0o755);
 
   return repository;
 }
@@ -223,15 +287,14 @@ test(
 );
 
 test("accepts uncommitted changes for a later worker snapshot", (context) => {
-  const repository = createRepository();
+  const repository = createDirtyRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
-  writeFileSync(join(repository, "untracked.txt"), "dirty\n");
 
   assert.equal(discoverRepository(repository).root, realpathSync(repository));
 });
 
 test("seeds a worker with caller changes without changing the caller", (context) => {
-  const repositoryRoot = createRepository();
+  const repositoryRoot = createDirtyRepository();
   const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
   const repository = discoverRepository(repositoryRoot);
   context.after(() => {
@@ -242,27 +305,14 @@ test("seeds a worker with caller changes without changing the caller", (context)
     rmSync(repositoryRoot, { force: true, recursive: true });
   });
 
-  writeFileSync(join(repositoryRoot, "README.md"), "Staged change\n");
-  runGit(repositoryRoot, ["add", "README.md"]);
-  writeFileSync(join(repositoryRoot, "README.md"), "Staged and unstaged change\n");
-  writeFileSync(join(repositoryRoot, "untracked.txt"), "Caller change\n");
-  const sourceStatus = execFileSync("git", ["status", "--porcelain=v1"], {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-  });
+  const sourceState = captureRepositoryState(repositoryRoot);
 
   const snapshot = createSeededWorktree(repository, worktree);
 
   assert.equal(readFileSync(join(worktree, "README.md"), "utf8"), "Staged and unstaged change\n");
   assert.equal(readFileSync(join(worktree, "untracked.txt"), "utf8"), "Caller change\n");
   assert.notEqual(snapshot.baseline, repository.head);
-  assert.equal(
-    execFileSync("git", ["status", "--porcelain=v1"], {
-      cwd: repositoryRoot,
-      encoding: "utf8",
-    }),
-    sourceStatus,
-  );
+  assertRepositoryState(repositoryRoot, sourceState);
 
   writeFileSync(join(worktree, "agent.test.ts"), "export {};\n");
   runGit(worktree, ["add", "agent.test.ts"]);
@@ -274,6 +324,143 @@ test("seeds a worker with caller changes without changing the caller", (context)
   assert.match(workerPatch, /agent\.test\.ts/);
   assert.doesNotMatch(workerPatch, /Staged and unstaged change/);
   assert.doesNotMatch(workerPatch, /untracked\.txt/);
+});
+
+test("seeds staged and unstaged tracked changes into the worker", (context) => {
+  const repositoryRoot = createRepositoryWithTrackedChanges();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  createSeededWorktree(repository, worktree);
+
+  assert.equal(readFileSync(join(worktree, "README.md"), "utf8"), "Staged and unstaged change\n");
+  assert.equal(existsSync(join(worktree, "delete.txt")), false);
+  assert.equal(existsSync(join(worktree, "rename-me.txt")), false);
+  assert.equal(readFileSync(join(worktree, "renamed.txt"), "utf8"), "Rename me\n");
+  assert.deepEqual(readFileSync(join(worktree, "binary.bin")), Buffer.from([0x00, 0xff, 0x02]));
+  assert.equal(statSync(join(worktree, "script.sh")).mode & 0o111, 0o111);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("copies non-ignored untracked files and safe symlinks into the worker", (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  writeFileSync(join(repositoryRoot, ".gitignore"), "ignored.txt\n");
+  runGit(repositoryRoot, ["add", ".gitignore"]);
+  runGit(repositoryRoot, ["commit", "--quiet", "-m", "Ignore fixture file"]);
+  mkdirSync(join(repositoryRoot, "nested"));
+  writeFileSync(join(repositoryRoot, "nested", "included.txt"), "Included\n");
+  writeFileSync(join(repositoryRoot, "ignored.txt"), "Ignored\n");
+  symlinkSync("nested/included.txt", join(repositoryRoot, "included-link"));
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  createSeededWorktree(repository, worktree);
+
+  assert.equal(readFileSync(join(worktree, "nested", "included.txt"), "utf8"), "Included\n");
+  assert.equal(readlinkSync(join(worktree, "included-link")), "nested/included.txt");
+  assert.equal(existsSync(join(worktree, "ignored.txt")), false);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("copies an untracked symlink to a tracked file whose name starts with two dots", (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  writeFileSync(join(repositoryRoot, "..config"), "Configuration\n");
+  runGit(repositoryRoot, ["add", "..config"]);
+  runGit(repositoryRoot, ["commit", "--quiet", "-m", "Add configuration fixture"]);
+  symlinkSync("..config", join(repositoryRoot, "config-link"));
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  createSeededWorktree(repository, worktree);
+
+  assert.equal(readlinkSync(join(worktree, "config-link")), "..config");
+  assert.equal(readFileSync(join(worktree, "config-link"), "utf8"), "Configuration\n");
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("rejects untracked snapshots that exceed a file or byte limit", (context) => {
+  const repositoryRoot = createRepository();
+  const fileLimitWorktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const byteLimitWorktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(fileLimitWorktree)) {
+      removeWorktree(repository, fileLimitWorktree);
+    }
+
+    if (existsSync(byteLimitWorktree)) {
+      removeWorktree(repository, byteLimitWorktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  writeFileSync(join(repositoryRoot, "one.txt"), "one\n");
+  writeFileSync(join(repositoryRoot, "two.txt"), "two\n");
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  assert.throws(
+    () => createSeededWorktree(repository, fileLimitWorktree, { maxBytes: 10, maxFiles: 1 }),
+    /Untracked snapshot has 2 files, exceeding the limit of 1\./,
+  );
+  assert.equal(existsSync(fileLimitWorktree), false);
+
+  assert.throws(
+    () => createSeededWorktree(repository, byteLimitWorktree, { maxBytes: 7, maxFiles: 2 }),
+    /Untracked snapshot has 8 bytes, exceeding the limit of 7\./,
+  );
+  assert.equal(existsSync(byteLimitWorktree), false);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("rejects an untracked symlink that escapes the repository", (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const outsideFile = join(tmpdir(), `codex-delegate-outside-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(outsideFile, { force: true });
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  writeFileSync(outsideFile, "Outside\n");
+  symlinkSync(`../${basename(outsideFile)}`, join(repositoryRoot, "outside-link"));
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  assert.throws(() => createSeededWorktree(repository, worktree), /Unsafe untracked symlink target/);
+  assert.equal(existsSync(worktree), false);
+  assertRepositoryState(repositoryRoot, sourceState);
 });
 
 test("does not run repository hooks for the baseline commit", (context) => {
@@ -308,11 +495,12 @@ test("does not run repository hooks for the baseline commit", (context) => {
   assert.equal(existsSync(postCommitMarker), false);
 });
 
-test("returns only fake-provider changes and removes the worker", async (context) => {
-  const repositoryRoot = createRepository();
+test("returns only worker changes from a dirty caller checkout", async (context) => {
+  const repositoryRoot = createDirtyRepository();
   const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
   const repository = discoverRepository(repositoryRoot);
   context.after(() => rmSync(repositoryRoot, { force: true, recursive: true }));
+  const sourceState = captureRepositoryState(repositoryRoot);
   const provider: Provider = {
     async run({ workspaceRoot }) {
       writeFileSync(join(workspaceRoot, "agent.test.ts"), "export {};\n");
@@ -334,18 +522,28 @@ test("returns only fake-provider changes and removes the worker", async (context
 
   assert.deepEqual(result.changedFiles, ["agent.test.ts"]);
   assert.match(result.patch.toString("utf8"), /agent\.test\.ts/);
+  assert.doesNotMatch(result.patch.toString("utf8"), /Staged and unstaged change/);
+  assert.doesNotMatch(result.patch.toString("utf8"), /untracked\.txt/);
   assert.equal(result.response, "Added a test.");
   assert.equal(result.providerStderr, "provider diagnostic\n");
   assert.equal(existsSync(worktree), false);
   assert.equal(existsSync(join(repositoryRoot, "agent.test.ts")), false);
+  assertRepositoryState(repositoryRoot, sourceState);
 });
 
 test("removes the worker after a provider is cancelled", async (context) => {
-  const repositoryRoot = createRepository();
+  const repositoryRoot = createDirtyRepository();
   const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
   const repository = discoverRepository(repositoryRoot);
   const controller = new AbortController();
-  context.after(() => rmSync(repositoryRoot, { force: true, recursive: true }));
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+  const sourceState = captureRepositoryState(repositoryRoot);
   const provider: Provider = {
     async run({ signal }) {
       await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
@@ -364,6 +562,40 @@ test("removes the worker after a provider is cancelled", async (context) => {
 
   await assert.rejects(run, RunCancelledError);
   assert.equal(existsSync(worktree), false);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("removes the worker after a provider failure without changing the caller", async (context) => {
+  const repositoryRoot = createDirtyRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+  const sourceState = captureRepositoryState(repositoryRoot);
+  const provider: Provider = {
+    async run() {
+      throw new Error("The provider failed.");
+    },
+  };
+
+  await assert.rejects(
+    delegate({
+      prompt: "Write a test",
+      provider,
+      repository,
+      signal: new AbortController().signal,
+      worktree,
+    }),
+    /The provider failed\./,
+  );
+
+  assert.equal(existsSync(worktree), false);
+  assertRepositoryState(repositoryRoot, sourceState);
 });
 
 test("rejects a directory outside a Git repository", (context) => {
