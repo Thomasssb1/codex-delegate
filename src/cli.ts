@@ -2,6 +2,7 @@
 
 import { Command, InvalidArgumentError } from "commander";
 import { loadAcceptedProviders } from "./providers.js";
+import { discoverRepository } from "./repository.js";
 
 type Provider = string;
 
@@ -31,6 +32,15 @@ program
   .action((agent: string, task: string, options: { provider: Provider }) => {
     if (agent.trim() === "" || task.trim() === "") {
       program.error("The agent name and task must be non-empty.");
+    }
+
+    try {
+      discoverRepository(process.cwd());
+    } catch (error) {
+      program.error(error instanceof Error ? error.message : String(error), {
+        code: "codex-delegate.git",
+        exitCode: 5,
+      });
     }
 
     console.log(`Run requested for ${agent} with provider ${options.provider}.`);
