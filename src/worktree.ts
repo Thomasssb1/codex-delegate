@@ -8,6 +8,22 @@ export type WorkerSnapshot = {
   worktree: string;
 };
 
+export type SnapshotLimits = {
+  maxBytes: number;
+  maxFiles: number;
+};
+
+export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
+  maxBytes: 52_428_800,
+  maxFiles: 10_000,
+};
+
+type UntrackedFile = {
+  path: string;
+  size: number;
+  symlinkTarget?: string;
+};
+
 function runGit(cwd: string, arguments_: string[], input?: Buffer): Buffer {
   const result = spawnSync("git", arguments_, { cwd, input });
 
@@ -31,31 +47,98 @@ function listUntrackedFiles(repository: Repository): string[] {
     .filter((path) => path !== "");
 }
 
-function resolveRepositoryPath(root: string, path: string): string {
-  const absolutePath = resolve(root, path);
+function assertRepositoryPath(root: string, absolutePath: string, description: string): void {
   const pathFromRoot = relative(root, absolutePath);
 
   if (pathFromRoot === "" || pathFromRoot.startsWith("..") || isAbsolute(pathFromRoot)) {
-    throw new Error(`Git returned an unsafe untracked path: ${path}`);
+    throw new Error(`Unsafe untracked ${description}: ${absolutePath}`);
   }
+}
+
+function resolveRepositoryPath(root: string, path: string): string {
+  const absolutePath = resolve(root, path);
+  assertRepositoryPath(root, absolutePath, "path");
 
   return absolutePath;
 }
 
-function copyUntrackedFile(repository: Repository, worktree: string, path: string): void {
-  const sourcePath = resolveRepositoryPath(repository.root, path);
+function validateSnapshotLimits(limits: SnapshotLimits): void {
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Snapshot limit ${name} must be a non-negative safe integer.`);
+    }
+  }
+}
+
+function collectUntrackedFiles(repository: Repository, limits: SnapshotLimits): UntrackedFile[] {
+  validateSnapshotLimits(limits);
+  const paths = listUntrackedFiles(repository);
+
+  if (paths.length > limits.maxFiles) {
+    throw new Error(`Untracked snapshot has ${paths.length} files, exceeding the limit of ${limits.maxFiles}.`);
+  }
+
+  let totalBytes = 0;
+  const files = paths.map((path) => {
+    const sourcePath = resolveRepositoryPath(repository.root, path);
+    const sourceStat = lstatSync(sourcePath);
+    const file: UntrackedFile = { path, size: sourceStat.size };
+
+    if (sourceStat.isSymbolicLink()) {
+      const symlinkTarget = readlinkSync(sourcePath);
+
+      if (isAbsolute(symlinkTarget)) {
+        throw new Error(`Unsafe untracked symlink target: ${path}`);
+      }
+
+      assertRepositoryPath(repository.root, resolve(dirname(sourcePath), symlinkTarget), "symlink target");
+      file.symlinkTarget = symlinkTarget;
+    } else if (!sourceStat.isFile()) {
+      throw new Error(`Unsupported untracked file type: ${path}`);
+    }
+
+    totalBytes += file.size;
+    if (totalBytes > limits.maxBytes) {
+      throw new Error(`Untracked snapshot has ${totalBytes} bytes, exceeding the limit of ${limits.maxBytes}.`);
+    }
+
+    return file;
+  });
+
+  return files;
+}
+
+function assertSafeDestinationParent(worktree: string, path: string): void {
   const destinationPath = resolveRepositoryPath(worktree, path);
+  let currentPath = worktree;
+
+  for (const segment of relative(worktree, dirname(destinationPath)).split("/")) {
+    if (segment === "") {
+      continue;
+    }
+
+    currentPath = join(currentPath, segment);
+    if (existsSync(currentPath) && lstatSync(currentPath).isSymbolicLink()) {
+      throw new Error(`Unsafe symlink in untracked destination path: ${path}`);
+    }
+  }
+}
+
+function copyUntrackedFile(repository: Repository, worktree: string, file: UntrackedFile): void {
+  const sourcePath = resolveRepositoryPath(repository.root, file.path);
+  const destinationPath = resolveRepositoryPath(worktree, file.path);
   const sourceStat = lstatSync(sourcePath);
 
+  assertSafeDestinationParent(worktree, file.path);
   mkdirSync(dirname(destinationPath), { recursive: true });
 
-  if (sourceStat.isSymbolicLink()) {
-    symlinkSync(readlinkSync(sourcePath), destinationPath);
+  if (file.symlinkTarget !== undefined && sourceStat.isSymbolicLink()) {
+    symlinkSync(file.symlinkTarget, destinationPath);
     return;
   }
 
   if (!sourceStat.isFile()) {
-    throw new Error(`Unsupported untracked file type: ${path}`);
+    throw new Error(`Unsupported untracked file type: ${file.path}`);
   }
 
   copyFileSync(sourcePath, destinationPath);
@@ -82,13 +165,17 @@ export function collectWorktreeChanges(worktree: string, baseline: string): {
   return { changedFiles, patch };
 }
 
-export function createSeededWorktree(repository: Repository, worktree: string): WorkerSnapshot {
+export function createSeededWorktree(
+  repository: Repository,
+  worktree: string,
+  limits: SnapshotLimits = DEFAULT_SNAPSHOT_LIMITS,
+): WorkerSnapshot {
   if (existsSync(worktree)) {
     throw new Error(`The worktree path already exists: ${worktree}`);
   }
 
   const trackedChanges = runGit(repository.root, ["diff", "--binary", repository.head]);
-  const untrackedFiles = listUntrackedFiles(repository);
+  const untrackedFiles = collectUntrackedFiles(repository, limits);
   runGit(repository.root, [
     "worktree",
     "add",
@@ -105,8 +192,8 @@ export function createSeededWorktree(repository: Repository, worktree: string): 
       runGit(worktree, ["apply", "--binary"], trackedChanges);
     }
 
-    for (const path of untrackedFiles) {
-      copyUntrackedFile(repository, worktree, path);
+    for (const file of untrackedFiles) {
+      copyUntrackedFile(repository, worktree, file);
     }
 
     runGit(worktree, ["add", "--all"]);

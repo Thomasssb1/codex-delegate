@@ -1,9 +1,21 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -336,6 +348,93 @@ test("seeds staged and unstaged tracked changes into the worker", (context) => {
   assert.equal(readFileSync(join(worktree, "renamed.txt"), "utf8"), "Rename me\n");
   assert.deepEqual(readFileSync(join(worktree, "binary.bin")), Buffer.from([0x00, 0xff, 0x02]));
   assert.equal(statSync(join(worktree, "script.sh")).mode & 0o111, 0o111);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("copies non-ignored untracked files and safe symlinks into the worker", (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  writeFileSync(join(repositoryRoot, ".gitignore"), "ignored.txt\n");
+  runGit(repositoryRoot, ["add", ".gitignore"]);
+  runGit(repositoryRoot, ["commit", "--quiet", "-m", "Ignore fixture file"]);
+  mkdirSync(join(repositoryRoot, "nested"));
+  writeFileSync(join(repositoryRoot, "nested", "included.txt"), "Included\n");
+  writeFileSync(join(repositoryRoot, "ignored.txt"), "Ignored\n");
+  symlinkSync("nested/included.txt", join(repositoryRoot, "included-link"));
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  createSeededWorktree(repository, worktree);
+
+  assert.equal(readFileSync(join(worktree, "nested", "included.txt"), "utf8"), "Included\n");
+  assert.equal(readlinkSync(join(worktree, "included-link")), "nested/included.txt");
+  assert.equal(existsSync(join(worktree, "ignored.txt")), false);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("rejects untracked snapshots that exceed a file or byte limit", (context) => {
+  const repositoryRoot = createRepository();
+  const fileLimitWorktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const byteLimitWorktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(fileLimitWorktree)) {
+      removeWorktree(repository, fileLimitWorktree);
+    }
+
+    if (existsSync(byteLimitWorktree)) {
+      removeWorktree(repository, byteLimitWorktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  writeFileSync(join(repositoryRoot, "one.txt"), "one\n");
+  writeFileSync(join(repositoryRoot, "two.txt"), "two\n");
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  assert.throws(
+    () => createSeededWorktree(repository, fileLimitWorktree, { maxBytes: 10, maxFiles: 1 }),
+    /Untracked snapshot has 2 files, exceeding the limit of 1\./,
+  );
+  assert.equal(existsSync(fileLimitWorktree), false);
+
+  assert.throws(
+    () => createSeededWorktree(repository, byteLimitWorktree, { maxBytes: 7, maxFiles: 2 }),
+    /Untracked snapshot has 8 bytes, exceeding the limit of 7\./,
+  );
+  assert.equal(existsSync(byteLimitWorktree), false);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("rejects an untracked symlink that escapes the repository", (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const outsideFile = join(tmpdir(), `codex-delegate-outside-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(outsideFile, { force: true });
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  writeFileSync(outsideFile, "Outside\n");
+  symlinkSync(`../${basename(outsideFile)}`, join(repositoryRoot, "outside-link"));
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  assert.throws(() => createSeededWorktree(repository, worktree), /Unsafe untracked symlink target/);
+  assert.equal(existsSync(worktree), false);
   assertRepositoryState(repositoryRoot, sourceState);
 });
 
