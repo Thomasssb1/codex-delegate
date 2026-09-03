@@ -3,6 +3,7 @@
 import { Command, CommanderError, InvalidArgumentError } from "commander";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { approvalModes, type ApprovalMode } from "./approval-mode.js";
@@ -17,6 +18,7 @@ import { createPrompt } from "./prompt.js";
 import { discoverRepository, type Repository } from "./repository.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
 import { resolveTask, TaskSourceError } from "./task.js";
+import type { InteractionRequest, InteractionResponse } from "./provider/provider.js";
 
 type Provider = string;
 
@@ -69,6 +71,104 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function parseInteractionResponse(value: string, interaction: InteractionRequest): InteractionResponse {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("Codex must reply with a JSON object.");
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("Codex must reply with a JSON object.");
+  }
+
+  if (interaction.kind === "approval") {
+    const answer = parsed as { choiceId?: unknown; feedback?: unknown };
+    if (typeof answer.choiceId !== "string" || !interaction.choices.some((choice) => choice.choiceId === answer.choiceId)) {
+      throw new Error("Codex selected an approval choice Muse did not offer.");
+    }
+    if (answer.feedback !== undefined && typeof answer.feedback !== "string") {
+      throw new Error("Codex approval feedback must be a string.");
+    }
+
+    return { ...(answer.feedback === undefined ? {} : { feedback: answer.feedback }), choiceId: answer.choiceId, kind: "approval" };
+  }
+
+  const answer = parsed as { answers?: unknown };
+  if (!Array.isArray(answer.answers)) {
+    throw new Error("Codex input answers must be an array.");
+  }
+
+  return {
+    answers: answer.answers as Extract<InteractionResponse, { kind: "userInput" }>["answers"],
+    kind: "userInput",
+  };
+}
+
+function createInteractionResponder() {
+  const reader = createInterface({ crlfDelay: Infinity, input: process.stdin });
+  const lines: string[] = [];
+  let inputClosed = false;
+  let previousRequest = Promise.resolve();
+  let rejectNextLine: ((error: Error) => void) | undefined;
+  let resolveNextLine: ((line: string) => void) | undefined;
+
+  reader.on("line", (line) => {
+    if (resolveNextLine !== undefined) {
+      const resolve = resolveNextLine;
+      rejectNextLine = undefined;
+      resolveNextLine = undefined;
+      resolve(line);
+      return;
+    }
+
+    lines.push(line);
+  });
+  reader.on("close", () => {
+    inputClosed = true;
+    rejectNextLine?.(new Error("Codex closed stdin while Muse was waiting for input."));
+    rejectNextLine = undefined;
+    resolveNextLine = undefined;
+  });
+
+  const nextLine = () => {
+    const line = lines.shift();
+    if (line !== undefined) {
+      return Promise.resolve(line);
+    }
+    if (inputClosed) {
+      return Promise.reject(new Error("Codex closed stdin while Muse was waiting for input."));
+    }
+
+    return new Promise<string>((resolve, reject) => {
+      resolveNextLine = resolve;
+      rejectNextLine = reject;
+    });
+  };
+
+  return {
+    close() {
+      reader.close();
+    },
+    async request(interaction: InteractionRequest): Promise<InteractionResponse> {
+      const previous = previousRequest;
+      let finishRequest: () => void = () => undefined;
+      previousRequest = new Promise<void>((resolve) => {
+        finishRequest = resolve;
+      });
+      await previous;
+
+      try {
+        process.stdout.write(`${JSON.stringify({ interaction, status: "interaction_required" })}\n`);
+        return parseInteractionResponse(await nextLine(), interaction);
+      } finally {
+        finishRequest();
+      }
+    },
+  };
+}
+
 function exitCodeFor(error: unknown): number {
   if (error instanceof CliError) {
     return error.exitCode;
@@ -98,7 +198,7 @@ program
   .option("--provider <provider>", "Override the profile and repository provider.", parseProvider)
   .option("--task <path>", "Read the task from a UTF-8 file.")
   .option("--timeout <duration>", "Abort after this much provider inactivity.", parseTimeout)
-  .option("--approval-mode <mode>", "Select denyUnmatched or fullAccess.", parseApprovalMode)
+  .option("--approval-mode <mode>", "Select alwaysAsk, approveForMe, denyUnmatched, or fullAccess.", parseApprovalMode)
   .option("--allow-all", "Required with approval mode fullAccess.")
   .option("--model <name>", "Ask the provider for a specific model.")
   .allowExcessArguments(false)
@@ -113,9 +213,10 @@ program
         provider?: Provider;
         task?: string;
         timeout?: number;
-      },
-    ) => {
+    },
+  ) => {
     let cancellation: ReturnType<typeof createRunCancellation> | undefined;
+    let interactions: ReturnType<typeof createInteractionResponder> | undefined;
 
     try {
       const { agent, task } = resolveTask({
@@ -127,6 +228,7 @@ program
         },
         taskPath: options.task,
       });
+      interactions = createInteractionResponder();
 
       const repository = discoverRunRepository();
       let profile;
@@ -156,6 +258,18 @@ program
         onActivity: cancellation.onActivity,
         prompt: createPrompt(profile.instructions, task),
         provider: new MuseProvider(configuration.muse),
+        requestInteraction: async (interaction) => {
+          cancellation?.pause();
+          try {
+            if (interactions === undefined) {
+              throw new Error("Codex interaction support is unavailable.");
+            }
+
+            return await interactions.request(interaction);
+          } finally {
+            cancellation?.onActivity();
+          }
+        },
         repository,
         signal: cancellation.signal,
         snapshotLimits: configuration.snapshotLimits,
@@ -177,6 +291,7 @@ program
       process.exitCode = exitCodeFor(error);
     } finally {
       cancellation?.dispose();
+      interactions?.close();
     }
     },
   );

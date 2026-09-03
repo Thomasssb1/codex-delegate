@@ -1,5 +1,5 @@
 import { rejectCancelledRun } from "./cancellation.js";
-import type { Provider } from "./provider/provider.js";
+import type { InteractionRequest, InteractionResponse, Provider } from "./provider/provider.js";
 import type { Repository } from "./repository.js";
 import { collectWorktreeChanges, createSeededWorktree, removeWorktree, type SnapshotOptions } from "./worktree.js";
 
@@ -14,6 +14,7 @@ export type DelegationRequest = {
   onActivity?(): void;
   prompt: string;
   provider: Provider;
+  requestInteraction?(interaction: InteractionRequest): Promise<InteractionResponse>;
   repository: Repository;
   signal: AbortSignal;
   snapshotLimits?: SnapshotOptions;
@@ -29,6 +30,7 @@ export async function delegate(request: DelegationRequest): Promise<DelegationRe
     const providerResult = await request.provider.run({
       onActivity: request.onActivity,
       prompt: request.prompt,
+      requestInteraction: request.requestInteraction,
       signal: request.signal,
       workspaceRoot: snapshot.worktree,
     });

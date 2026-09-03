@@ -17,6 +17,7 @@ type SignalEmitter = {
 export type RunCancellation = {
   dispose(): void;
   onActivity(): void;
+  pause(): void;
   signal: AbortSignal;
 };
 
@@ -40,6 +41,9 @@ export function createRunCancellation(
       signalEmitter.off("SIGINT", interrupt);
     },
     onActivity,
+    pause() {
+      clearTimeout(timeout);
+    },
     signal: controller.signal,
   };
 }

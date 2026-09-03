@@ -31,7 +31,6 @@ import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
 import { resolveTask } from "./task.js";
-import { chooseDenial } from "./provider/muse.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
 
@@ -152,7 +151,7 @@ test("loads the bundled test-writer agent", () => {
   assert.equal(agent.source, "bundled");
   assert.equal(agent.description, "Add tests for an existing implementation.");
   assert.equal(agent.provider, "muse");
-  assert.equal(agent.approvalMode, "denyUnmatched");
+  assert.equal(agent.approvalMode, "approveForMe");
   assert.match(agent.instructions, /Write tests for the behaviour described in the task\./);
 });
 
@@ -211,45 +210,31 @@ test("rejects agent profiles with an unsupported provider", (context) => {
   assert.throws(() => loadAgent(repository, "test-writer"), /provider is unsupported: other/);
 });
 
-test("allows only non-interactive approval modes", (context) => {
+test("accepts Codex approval modes and rejects Muse mode names", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
   mkdirSync(join(repository, ".codex-agents"));
   const profilePath = join(repository, ".codex-agents", "test-writer.md");
   writeFileSync(
     profilePath,
+    "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: alwaysAsk\n---\nProject instructions\n",
+  );
+
+  assert.equal(loadAgent(repository, "test-writer").approvalMode, "alwaysAsk");
+
+  writeFileSync(
+    profilePath,
     "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: denyUnmatched\n---\nProject instructions\n",
   );
 
   assert.equal(loadAgent(repository, "test-writer").approvalMode, "denyUnmatched");
-
-  writeFileSync(
-    profilePath,
-    "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: approveForMe\n---\nProject instructions\n",
-  );
-
-  assert.throws(() => loadAgent(repository, "test-writer"), /approvalMode must be one of: denyUnmatched, fullAccess/);
 });
 
 test("uses Muse's default-deny approval mode", () => {
   assert.equal(toMuseApprovalMode("denyUnmatched"), "denyUnmatched");
 });
 
-test("chooses Muse's offered denial when handling an approval request", () => {
-  assert.deepEqual(
-    chooseDenial([
-      { choiceId: "approve", decision: "approved" },
-      { acceptsFeedback: true, choiceId: "deny", decision: "denied" },
-    ]),
-    {
-      choiceId: "deny",
-      feedback: "codex-delegate runs headlessly and cannot approve this action.",
-    },
-  );
-  assert.throws(() => chooseDenial([{ choiceId: "approve", decision: "approved" }]), /without offering a denial choice/);
-});
-
-test("defaults a run to denyUnmatched", () => {
+test("defaults a run to approveForMe", () => {
   const configuration = resolveRunConfiguration("/not-a-repository", {
     description: "Profile instructions.",
     instructions: "Do the task.",
@@ -257,7 +242,7 @@ test("defaults a run to denyUnmatched", () => {
     source: "project",
   });
 
-  assert.equal(configuration.muse.approvalMode, "denyUnmatched");
+  assert.equal(configuration.muse.approvalMode, "approveForMe");
 });
 
 test("resolves repository configuration with CLI and profile precedence", (context) => {
@@ -354,6 +339,17 @@ test("resets the inactivity deadline when the provider reports activity", async 
   await new Promise((resolve) => setTimeout(resolve, 60));
   cancellation.onActivity();
   await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(cancellation.signal.aborted, false);
+  cancellation.dispose();
+});
+
+test("pauses the inactivity deadline while Codex answers Muse", async () => {
+  const cancellation = createRunCancellation(10, new EventEmitter());
+  cancellation.onActivity();
+  cancellation.pause();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
 
   assert.equal(cancellation.signal.aborted, false);
   cancellation.dispose();
@@ -801,6 +797,7 @@ test("returns only worker changes from a dirty caller checkout", async (context)
   assert.equal(existsSync(join(repositoryRoot, "agent.test.ts")), false);
   assertRepositoryState(repositoryRoot, sourceState);
 });
+
 
 test("removes the worker after a provider is cancelled", async (context) => {
   const repositoryRoot = createDirtyRepository();
