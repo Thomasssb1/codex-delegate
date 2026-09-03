@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import {
   chmodSync,
   existsSync,
@@ -27,8 +28,11 @@ import type { Provider } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
+import { createInteractionResponder } from "./interaction.js";
+import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
+import { MuseProvider } from "./provider/muse.js";
 import { resolveTask } from "./task.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
@@ -160,6 +164,8 @@ test("loads the bundled reviewer agent", () => {
 
   assert.equal(agent.source, "bundled");
   assert.equal(agent.description, "Review the current changes for correctness and regressions.");
+  assert.equal(agent.provider, "muse");
+  assert.equal(agent.approvalMode, "approveForMe");
   assert.match(agent.instructions, /Do not modify files or commit\./);
   assert.match(agent.instructions, /"verdict": "approved" \| "changes_requested"/);
 });
@@ -249,7 +255,127 @@ test("accepts Codex approval modes and rejects Muse mode names", (context) => {
     "---\nname: test-writer\ndescription: Project test instructions.\napprovalMode: denyUnmatched\n---\nProject instructions\n",
   );
 
-  assert.throws(() => loadAgent(repository, "test-writer"), /approvalMode must be one of: alwaysAsk, approveForMe, fullAccess/);
+  assert.equal(loadAgent(repository, "test-writer").approvalMode, "denyUnmatched");
+});
+
+test("maps the denyUnmatched approval mode to Muse", () => {
+  assert.equal(toMuseApprovalMode("denyUnmatched"), "denyUnmatched");
+});
+
+test("defaults a run to approveForMe", () => {
+  const configuration = resolveRunConfiguration("/not-a-repository", {
+    description: "Profile instructions.",
+    instructions: "Do the task.",
+    name: "test-writer",
+    source: "project",
+  });
+
+  assert.equal(configuration.muse.approvalMode, "approveForMe");
+});
+
+function approvalRequest() {
+  return {
+    approvalId: "approval",
+    choices: [
+      { choiceId: "allow", decision: "approved", label: "Allow" },
+      { acceptsFeedback: true, choiceId: "deny", decision: "denied", label: "Deny" },
+    ],
+    kind: "approval" as const,
+    requirementId: { approvalId: "approval", sourceIndex: 1 },
+    toolName: "shell",
+    turnId: "turn",
+  };
+}
+
+function userInputRequest() {
+  return {
+    kind: "userInput" as const,
+    questions: [
+      {
+        header: "Colour",
+        id: "colour",
+        options: [{ label: "Blue" }, { label: "Red" }],
+        question: "Which colour?",
+        selection: { mode: "single" as const },
+      },
+      {
+        header: "Features",
+        id: "features",
+        options: [{ label: "Fast" }, { label: "Small" }],
+        question: "Which features?",
+        selection: { maxSelections: 2, minSelections: 1, mode: "multiple" as const },
+      },
+    ],
+    toolName: "ask_user",
+    turnId: "turn",
+    userInputId: "input",
+  };
+}
+
+function createTestResponder() {
+  const input = new PassThrough();
+  const output: string[] = [];
+  const responder = createInteractionResponder(input, { write: (chunk) => output.push(chunk) });
+
+  return { input, output, responder };
+}
+
+test("streams an approval request and accepts an offered choice", async () => {
+  const { input, output, responder } = createTestResponder();
+  const pending = responder.request(approvalRequest());
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(output[0]), { interaction: approvalRequest(), status: "interaction_required" });
+  input.write('{"choiceId":"deny","feedback":"Use the safe path."}\n');
+
+  await assert.doesNotReject(pending);
+  assert.deepEqual(await pending, { choiceId: "deny", feedback: "Use the safe path.", kind: "approval" });
+  responder.close();
+});
+
+test("streams multiple user-input answers", async () => {
+  const { input, output, responder } = createTestResponder();
+  const pending = responder.request(userInputRequest());
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(output[0]), { interaction: userInputRequest(), status: "interaction_required" });
+  input.write('{"answers":[{"questionId":"colour","selectedLabel":"Blue"},{"questionId":"features","selectedLabels":["Fast","Small"]}]}\n');
+
+  assert.deepEqual(await pending, {
+    answers: [
+      { questionId: "colour", selectedLabel: "Blue" },
+      { questionId: "features", selectedLabels: ["Fast", "Small"] },
+    ],
+    kind: "userInput",
+  });
+  responder.close();
+});
+
+test("serializes back-to-back Muse requests", async () => {
+  const { input, output, responder } = createTestResponder();
+  const approval = responder.request(approvalRequest());
+  const inputRequest = responder.request(userInputRequest());
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(output.length, 1);
+  input.write('{"choiceId":"allow"}\n');
+  await approval;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(output.length, 2);
+  input.write('{"answers":[]}\n');
+
+  assert.deepEqual(await inputRequest, { answers: [], kind: "userInput" });
+  responder.close();
+});
+
+test("fails an interaction when Codex closes stdin", async () => {
+  const { input, responder } = createTestResponder();
+  const pending = responder.request(approvalRequest());
+
+  input.end();
+
+  await assert.rejects(pending, /closed stdin while Muse was waiting/);
+  responder.close();
 });
 
 test("rejects removed change rules", (context) => {
@@ -279,13 +405,13 @@ test("resolves repository configuration with CLI and profile precedence", (conte
       "muse:",
       "  binary: configured-muse",
       "  model: configured-model",
-      "  approvalMode: alwaysAsk",
+      "  approvalMode: denyUnmatched",
       "",
     ].join("\n"),
   );
 
   const profile = {
-    approvalMode: "approveForMe" as const,
+    approvalMode: "denyUnmatched" as const,
     description: "Profile instructions.",
     instructions: "Do the task.",
     model: "profile-model",
@@ -295,7 +421,8 @@ test("resolves repository configuration with CLI and profile precedence", (conte
   };
   const configured = resolveRunConfiguration(repository, profile);
   const overridden = resolveRunConfiguration(repository, profile, {
-    approvalMode: "alwaysAsk",
+    allowAll: true,
+    approvalMode: "fullAccess",
     model: "cli-model",
     provider: "muse",
     timeoutMs: parseInactivityTimeout("2m"),
@@ -304,7 +431,7 @@ test("resolves repository configuration with CLI and profile precedence", (conte
   assert.deepEqual(configured, {
     inactivityTimeoutMs: 45_000,
     muse: {
-      approvalMode: "approveForMe",
+      approvalMode: "denyUnmatched",
       binary: "configured-muse",
       model: "profile-model",
     },
@@ -316,7 +443,7 @@ test("resolves repository configuration with CLI and profile precedence", (conte
     },
   });
   assert.equal(overridden.inactivityTimeoutMs, 120_000);
-  assert.equal(overridden.muse.approvalMode, "alwaysAsk");
+  assert.equal(overridden.muse.approvalMode, "fullAccess");
   assert.equal(overridden.muse.model, "cli-model");
 });
 
@@ -362,6 +489,55 @@ test("resets the inactivity deadline when the provider reports activity", async 
   cancellation.dispose();
 });
 
+test("pauses the inactivity deadline while Codex answers Muse", async () => {
+  const cancellation = createRunCancellation(10, new EventEmitter());
+  cancellation.onActivity();
+  cancellation.pause();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(cancellation.signal.aborted, false);
+  cancellation.dispose();
+});
+
+test("waits for every pending Muse interaction before resuming the inactivity deadline", async () => {
+  const cancellation = createRunCancellation(10, new EventEmitter());
+  cancellation.onActivity();
+  cancellation.pause();
+  cancellation.pause();
+  cancellation.resume();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(cancellation.signal.aborted, false);
+  cancellation.resume();
+  await new Promise<void>((resolve) => cancellation.signal.addEventListener("abort", () => resolve(), { once: true }));
+  assert.equal(cancellation.signal.reason instanceof RunCancelledError, true);
+  assert.equal(cancellation.signal.reason.cause, "inactivity");
+  cancellation.dispose();
+});
+
+test("preserves cancellation when closing Muse makes a session operation fail", async () => {
+  for (const cause of ["inactivity", "signal"] as const) {
+    const controller = new AbortController();
+    const provider = new MuseProvider();
+    const unsafeProvider = provider as unknown as { runTurn(): Promise<never> };
+    unsafeProvider.runTurn = async () => {
+      controller.abort(new RunCancelledError(cause));
+      throw new Error("Muse transport closed.");
+    };
+
+    await assert.rejects(
+      provider.run({
+        prompt: "Do the task.",
+        signal: controller.signal,
+        workspaceRoot: process.cwd(),
+      }),
+      (error: unknown) => error instanceof RunCancelledError && error.cause === cause,
+    );
+  }
+});
+
 test("cancels a run when it receives SIGINT", () => {
   const signals = new EventEmitter();
   const cancellation = createRunCancellation(60_000, signals);
@@ -397,10 +573,10 @@ test("requires one non-empty task source", (context) => {
   const result = runCli(repository, "run", "--provider", "muse");
 
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /Supply a task as a positional argument, --task file, or stdin/);
+  assert.match(result.stderr, /Supply a task as a positional argument or --task file/);
 });
 
-test("resolves positional, file, and stdin task input", (context) => {
+test("resolves positional and file task input", (context) => {
   const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
   const taskPath = join(directory, "task.md");
   context.after(() => rmSync(directory, { force: true, recursive: true }));
@@ -410,66 +586,77 @@ test("resolves positional, file, and stdin task input", (context) => {
     resolveTask({
       agent: "custom-agent",
       positional: "A positional task.",
-      stdin: { isTTY: true, read: () => Buffer.alloc(0) },
     }),
     { agent: "custom-agent", task: "A positional task." },
   );
   assert.deepEqual(
     resolveTask({
       positional: "custom-agent",
-      stdin: { isTTY: true, read: () => Buffer.alloc(0) },
       taskPath,
     }),
     { agent: "custom-agent", task: "A task from a file.\n" },
   );
-  assert.deepEqual(
-    resolveTask({
-      positional: "custom-agent",
-      stdin: { isTTY: false, read: () => Buffer.from("A task from stdin.\n") },
-    }),
-    { agent: "custom-agent", task: "A task from stdin.\n" },
-  );
 });
 
 test("rejects ambiguous, empty, and invalid task sources", () => {
-  const terminal = { isTTY: true, read: () => Buffer.alloc(0) };
-  const pipe = { isTTY: false, read: () => Buffer.from("A task from stdin.\n") };
-
   assert.throws(
-    () => resolveTask({ positional: "task", stdin: pipe, taskPath: "task.md" }),
-    /either --task or stdin, not both/,
-  );
-  assert.throws(
-    () => resolveTask({ agent: "agent", positional: "task", stdin: pipe }),
+    () => resolveTask({ positional: "task", agent: "agent", taskPath: "task.md" }),
     /only one positional agent name/,
   );
   assert.throws(
-    () => resolveTask({ positional: "   ", stdin: terminal }),
-    /must be non-empty/,
+    () => resolveTask({}),
+    /positional argument or --task file/,
   );
   assert.throws(
-    () => resolveTask({ positional: "agent", stdin: { isTTY: false, read: () => Buffer.from([0xff]) } }),
-    /not valid UTF-8/,
+    () => resolveTask({ positional: "   " }),
+    /must be non-empty/,
   );
 });
 
-test("accepts file and stdin task input before repository discovery", (context) => {
+test("accepts file task input before repository discovery", (context) => {
   const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
   const taskPath = join(directory, "task.md");
   context.after(() => rmSync(directory, { force: true, recursive: true }));
   writeFileSync(taskPath, "A task from a file.\n");
 
   const fileResult = runCli(directory, "run", "test-writer", "--task", taskPath, "--provider", "muse");
-  const stdinResult = spawnSync(process.execPath, [cliPath, "run", "test-writer", "--provider", "muse"], {
-    cwd: directory,
-    encoding: "utf8",
-    input: "A task from stdin.\n",
-  });
 
   assert.equal(fileResult.status, 5);
   assert.match(fileResult.stderr, /Run codex-delegate from inside a non-bare Git worktree/);
-  assert.equal(stdinResult.status, 5);
-  assert.match(stdinResult.stderr, /Run codex-delegate from inside a non-bare Git worktree/);
+});
+
+test("does not drain stdin when a task is supplied outside stdin", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+
+  for (const arguments_ of [
+    ["run", "A positional task.", "--provider", "muse"],
+    ["run", "test-writer", "--task", join(directory, "task.md"), "--provider", "muse"],
+  ]) {
+    writeFileSync(join(directory, "task.md"), "A task from a file.\n");
+    const child = spawn(process.execPath, [cliPath, ...arguments_], {
+      cwd: directory,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill();
+        reject(new Error("CLI waited for EOF on stdin."));
+      }, 1_000);
+      child.once("close", (code) => {
+        clearTimeout(timeout);
+        resolve(code);
+      });
+    });
+
+    assert.equal(exitCode, 5);
+    assert.match(stderr, /Run codex-delegate from inside a non-bare Git worktree/);
+  }
 });
 
 test("discovers the Git root from a nested directory", (context) => {
@@ -804,6 +991,7 @@ test("returns only worker changes from a dirty caller checkout", async (context)
   assert.equal(existsSync(join(repositoryRoot, "agent.test.ts")), false);
   assertRepositoryState(repositoryRoot, sourceState);
 });
+
 
 test("removes the worker after a provider is cancelled", async (context) => {
   const repositoryRoot = createDirtyRepository();

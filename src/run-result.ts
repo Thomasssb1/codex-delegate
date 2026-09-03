@@ -15,6 +15,7 @@ export function createRunResult(delegation: DelegationResult): RunResult {
   };
 }
 
+
 export function createFailedRunResult(error: string, stderr = ""): RunResult {
   return { error, stderr };
 }
