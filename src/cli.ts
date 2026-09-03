@@ -2,6 +2,7 @@
 
 import { Command, CommanderError, InvalidArgumentError } from "commander";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadAgent } from "./agents/loader.js";
@@ -13,6 +14,7 @@ import { ProviderRunError } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { discoverRepository, type Repository } from "./repository.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
+import { resolveTask, TaskSourceError } from "./task.js";
 
 type Provider = string;
 
@@ -54,6 +56,10 @@ function exitCodeFor(error: unknown): number {
     return error.exitCode;
   }
 
+  if (error instanceof TaskSourceError) {
+    return 2;
+  }
+
   if (error instanceof CommanderError) {
     return error.exitCode;
   }
@@ -69,17 +75,24 @@ program
   .description("Delegate bounded coding tasks to external agents.")
   .showSuggestionAfterError()
   .showHelpAfterError()
-  .command("run <task> [agent]")
+  .command("run [task-or-agent] [agent]")
   .description("Delegate a task to an agent.")
   .requiredOption("--provider <provider>", "Provider to use.", parseProvider)
+  .option("--task <path>", "Read the task from a UTF-8 file.")
   .allowExcessArguments(false)
-  .action(async (task: string, agent = "test-writer") => {
+  .action(async (taskOrAgent: string | undefined, positionalAgent: string | undefined, options: { task?: string }) => {
     let cancellation: ReturnType<typeof createRunCancellation> | undefined;
 
     try {
-      if (agent.trim() === "" || task.trim() === "") {
-        throw new CliError("The agent name and task must be non-empty.", 2);
-      }
+      const { agent, task } = resolveTask({
+        agent: positionalAgent,
+        positional: taskOrAgent,
+        stdin: {
+          isTTY: process.stdin.isTTY,
+          read: () => readFileSync(0),
+        },
+        taskPath: options.task,
+      });
 
       const repository = discoverRunRepository();
       let profile;
