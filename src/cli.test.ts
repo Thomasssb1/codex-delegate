@@ -235,6 +235,27 @@ test("lists project agents and overrides", (context) => {
   );
 });
 
+test("lists symlinked project agent profiles", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  const profilePath = join(repository, "accessibility-profile.md");
+  writeFileSync(
+    profilePath,
+    "---\nname: accessibility\ndescription: Review accessibility.\n---\nReview the change.\n",
+  );
+  symlinkSync("../accessibility-profile.md", join(repository, ".codex-agents", "accessibility.md"));
+
+  assert.deepEqual(
+    listAgents(repository).map(({ name, source }) => ({ name, source })),
+    [
+      { name: "accessibility", source: "project" },
+      { name: "reviewer", source: "bundled" },
+      { name: "test-writer", source: "bundled" },
+    ],
+  );
+});
+
 test("rejects an unknown agent profile", () => {
   assert.throws(() => loadAgent("/not-a-repository", "missing-agent"), /Agent profile not found: missing-agent/);
 });
