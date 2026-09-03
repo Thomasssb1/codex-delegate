@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import test from "node:test";
@@ -63,6 +63,27 @@ function createDirtyRepository(): string {
   runGit(repository, ["add", "README.md"]);
   writeFileSync(join(repository, "README.md"), "Staged and unstaged change\n");
   writeFileSync(join(repository, "untracked.txt"), "Caller change\n");
+
+  return repository;
+}
+
+function createRepositoryWithTrackedChanges(): string {
+  const repository = createRepository();
+
+  writeFileSync(join(repository, "delete.txt"), "Delete me\n");
+  writeFileSync(join(repository, "rename-me.txt"), "Rename me\n");
+  writeFileSync(join(repository, "binary.bin"), Buffer.from([0x00, 0x01, 0x02]));
+  writeFileSync(join(repository, "script.sh"), "#!/bin/sh\necho initial\n");
+  runGit(repository, ["add", "delete.txt", "rename-me.txt", "binary.bin", "script.sh"]);
+  runGit(repository, ["commit", "--quiet", "-m", "Tracked fixture files"]);
+
+  writeFileSync(join(repository, "README.md"), "Staged change\n");
+  runGit(repository, ["add", "README.md"]);
+  writeFileSync(join(repository, "README.md"), "Staged and unstaged change\n");
+  runGit(repository, ["mv", "rename-me.txt", "renamed.txt"]);
+  rmSync(join(repository, "delete.txt"));
+  writeFileSync(join(repository, "binary.bin"), Buffer.from([0x00, 0xff, 0x02]));
+  chmodSync(join(repository, "script.sh"), 0o755);
 
   return repository;
 }
@@ -291,6 +312,31 @@ test("seeds a worker with caller changes without changing the caller", (context)
   assert.match(workerPatch, /agent\.test\.ts/);
   assert.doesNotMatch(workerPatch, /Staged and unstaged change/);
   assert.doesNotMatch(workerPatch, /untracked\.txt/);
+});
+
+test("seeds staged and unstaged tracked changes into the worker", (context) => {
+  const repositoryRoot = createRepositoryWithTrackedChanges();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  createSeededWorktree(repository, worktree);
+
+  assert.equal(readFileSync(join(worktree, "README.md"), "utf8"), "Staged and unstaged change\n");
+  assert.equal(existsSync(join(worktree, "delete.txt")), false);
+  assert.equal(existsSync(join(worktree, "rename-me.txt")), false);
+  assert.equal(readFileSync(join(worktree, "renamed.txt"), "utf8"), "Rename me\n");
+  assert.deepEqual(readFileSync(join(worktree, "binary.bin")), Buffer.from([0x00, 0xff, 0x02]));
+  assert.equal(statSync(join(worktree, "script.sh")).mode & 0o111, 0o111);
+  assertRepositoryState(repositoryRoot, sourceState);
 });
 
 test("does not run repository hooks for the baseline commit", (context) => {
