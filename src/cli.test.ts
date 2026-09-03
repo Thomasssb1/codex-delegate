@@ -163,6 +163,8 @@ test("loads the bundled reviewer agent", () => {
 
   assert.equal(agent.source, "bundled");
   assert.equal(agent.description, "Review the current changes for correctness and regressions.");
+  assert.equal(agent.provider, "muse");
+  assert.equal(agent.approvalMode, "approveForMe");
   assert.match(agent.instructions, /Do not modify files or commit\./);
   assert.match(agent.instructions, /"verdict": "approved" \| "changes_requested"/);
 });
@@ -255,7 +257,7 @@ test("accepts Codex approval modes and rejects Muse mode names", (context) => {
   assert.equal(loadAgent(repository, "test-writer").approvalMode, "denyUnmatched");
 });
 
-test("uses Muse's default-deny approval mode", () => {
+test("maps the denyUnmatched approval mode to Muse", () => {
   assert.equal(toMuseApprovalMode("denyUnmatched"), "denyUnmatched");
 });
 
