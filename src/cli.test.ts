@@ -26,13 +26,13 @@ import { createSeededWorktree, removeWorktree } from "./worktree.js";
 import { delegate } from "./delegate.js";
 import type { Provider } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
-import { loadAgent } from "./agents/loader.js";
+import { listAgents, loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
 import { createInteractionResponder } from "./interaction.js";
 import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
-import { MuseProvider } from "./provider/muse.js";
+import { museFailureMessage, MuseProvider } from "./provider/muse.js";
 import { resolveTask } from "./task.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
@@ -148,6 +148,22 @@ test("returns raw diagnostics with a failed JSON result", () => {
   });
 });
 
+test("preserves a Muse terminal failure's details", () => {
+  assert.equal(
+    museFailureMessage({
+      kind: "completed",
+      params: {
+        error: {
+          kind: "modelError",
+          message: "Usage limit exhausted.",
+        },
+        terminal: "failed",
+      },
+    }),
+    "Muse run failed (modelError): Usage limit exhausted.",
+  );
+});
+
 test("loads the bundled test-writer agent", () => {
   const agent = loadAgent("/not-a-repository", "test-writer");
 
@@ -170,6 +186,72 @@ test("loads the bundled reviewer agent", () => {
   assert.match(agent.instructions, /"verdict": "approved" \| "changes_requested"/);
 });
 
+test("lists bundled agents", () => {
+  assert.deepEqual(
+    listAgents().map(({ name, source }) => ({ name, source })),
+    [
+      { name: "reviewer", source: "bundled" },
+      { name: "test-writer", source: "bundled" },
+    ],
+  );
+});
+
+test("lists available agents through the CLI", (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+
+  const result = runCli(directory, "agents");
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    agents: [
+      {
+        description: "Review the current changes for correctness and regressions.",
+        name: "reviewer",
+        source: "bundled",
+      },
+      {
+        description: "Add tests for an existing implementation.",
+        name: "test-writer",
+        source: "bundled",
+      },
+    ],
+  });
+});
+
+test("lists a project agent's model", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\nmodel: muse-spark-1.3\n---\nProject instructions\n",
+  );
+
+  const result = runCli(repository, "agents");
+
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout) as { agents: { model?: string; name: string }[] };
+  assert.equal(output.agents.find((agent) => agent.name === "test-writer")?.model, "muse-spark-1.3");
+});
+
+test("reports invalid project agent profiles with exit code 2", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\nprovider: other\n---\nProject instructions\n",
+  );
+
+  const result = runCli(repository, "agents");
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Invalid agent profile .*provider is unsupported: other/);
+  const output = JSON.parse(result.stdout) as { error: string };
+  assert.match(output.error, /Invalid agent profile .*provider is unsupported: other/);
+});
+
 test("uses a project agent before its bundled counterpart", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
@@ -183,6 +265,50 @@ test("uses a project agent before its bundled counterpart", (context) => {
 
   assert.equal(agent.source, "project");
   assert.equal(agent.instructions, "Project instructions");
+});
+
+test("lists project agents and overrides", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\n---\nProject instructions\n",
+  );
+  writeFileSync(
+    join(repository, ".codex-agents", "accessibility.md"),
+    "---\nname: accessibility\ndescription: Review accessibility.\n---\nReview the change.\n",
+  );
+
+  assert.deepEqual(
+    listAgents(repository).map(({ description, name, source }) => ({ description, name, source })),
+    [
+      { description: "Review accessibility.", name: "accessibility", source: "project" },
+      { description: "Review the current changes for correctness and regressions.", name: "reviewer", source: "bundled" },
+      { description: "Project test instructions.", name: "test-writer", source: "project" },
+    ],
+  );
+});
+
+test("lists symlinked project agent profiles", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  const profilePath = join(repository, "accessibility-profile.md");
+  writeFileSync(
+    profilePath,
+    "---\nname: accessibility\ndescription: Review accessibility.\n---\nReview the change.\n",
+  );
+  symlinkSync("../accessibility-profile.md", join(repository, ".codex-agents", "accessibility.md"));
+
+  assert.deepEqual(
+    listAgents(repository).map(({ name, source }) => ({ name, source })),
+    [
+      { name: "accessibility", source: "project" },
+      { name: "reviewer", source: "bundled" },
+      { name: "test-writer", source: "bundled" },
+    ],
+  );
 });
 
 test("rejects an unknown agent profile", () => {
@@ -564,6 +690,18 @@ test("rejects providers other than Muse", (context) => {
   const output = JSON.parse(result.stdout) as Record<string, unknown>;
   assert.match(output.error as string, /Unsupported provider: other\. Supported providers: muse\./);
   assert.equal(output.stderr, "");
+});
+
+test("shows run help without a JSON error result", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+
+  const result = runCli(repository, "run", "--help");
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /Usage: codex-delegate run/);
+  assert.doesNotMatch(result.stdout, /"error"/);
+  assert.equal(result.stderr, "");
 });
 
 test("requires one non-empty task source", (context) => {

@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { approvalModes, type ApprovalMode } from "./approval-mode.js";
-import { loadAgent } from "./agents/loader.js";
+import { listAgents, loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
 import { ConfigurationError, parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { delegate } from "./delegate.js";
@@ -65,6 +65,14 @@ function discoverRunRepository(): Repository {
   }
 }
 
+function discoverAgentRepository(): Repository | undefined {
+  try {
+    return discoverRepository(process.cwd());
+  } catch {
+    return undefined;
+  }
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -93,6 +101,23 @@ program
   .description("Delegate bounded coding tasks to external agents.")
   .showSuggestionAfterError()
   .showHelpAfterError()
+
+  .command("agents")
+  .description("List available agents.")
+  .action(() => {
+    const repository = discoverAgentRepository();
+    let agents;
+
+    try {
+      agents = listAgents(repository?.root).map(({ description, model, name, source }) => ({ description, model, name, source }));
+    } catch (error) {
+      throw new CliError(errorMessage(error), 2);
+    }
+
+    process.stdout.write(`${JSON.stringify({ agents })}\n`);
+  });
+
+program
   .command("run [task-or-agent] [agent]")
   .description("Delegate a task to an agent. Standard input accepts JSON interaction replies.")
   .option("--provider <provider>", "Override the profile and repository provider.", parseProvider)
@@ -193,6 +218,10 @@ program
   );
 
 program.parseAsync().catch((error: unknown) => {
+  if (error instanceof CommanderError && error.code === "commander.helpDisplayed") {
+    return;
+  }
+
   const runResult = createFailedRunResult(errorMessage(error));
 
   process.stderr.write(`${runResult.error}\n`);
