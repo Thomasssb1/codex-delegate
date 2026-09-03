@@ -106,7 +106,13 @@ program
   .description("List available agents.")
   .action(() => {
     const repository = discoverAgentRepository();
-    const agents = listAgents(repository?.root).map(({ description, name, source }) => ({ description, name, source }));
+    let agents;
+
+    try {
+      agents = listAgents(repository?.root).map(({ description, name, source }) => ({ description, name, source }));
+    } catch (error) {
+      throw new CliError(errorMessage(error), 2);
+    }
 
     process.stdout.write(`${JSON.stringify({ agents })}\n`);
   });

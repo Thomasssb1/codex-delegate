@@ -203,6 +203,23 @@ test("lists available agents through the CLI", (context) => {
   });
 });
 
+test("reports invalid project agent profiles with exit code 2", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\nprovider: other\n---\nProject instructions\n",
+  );
+
+  const result = runCli(repository, "agents");
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Invalid agent profile .*provider is unsupported: other/);
+  const output = JSON.parse(result.stdout) as { error: string };
+  assert.match(output.error, /Invalid agent profile .*provider is unsupported: other/);
+});
+
 test("uses a project agent before its bundled counterpart", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
