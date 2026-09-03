@@ -18,3 +18,9 @@ For user interfaces, cover every user action and its observable result. Include 
 For backends, exercise API routes through the application. Cover valid and invalid input, authentication or origin checks where relevant, status, body, headers, external command failure, and state changes. Test concurrency at the boundary that enforces the rule.
 
 Keep one focused test for each distinct behaviour. Combine assertions that follow from one action. Before finishing, check that each test describes its scenario accurately, would fail if that behaviour broke, and would survive a behaviour-preserving refactor.
+
+Finish with JSON only:
+
+```json
+{ "summary": "What you changed", "notes": ["Anything the caller should know"] }
+```
