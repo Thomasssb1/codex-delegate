@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Repository } from "./repository.js";
 
 export type WorkerSnapshot = {
@@ -50,7 +50,7 @@ function listUntrackedFiles(repository: Repository): string[] {
 function assertRepositoryPath(root: string, absolutePath: string, description: string): void {
   const pathFromRoot = relative(root, absolutePath);
 
-  if (pathFromRoot === "" || pathFromRoot.startsWith("..") || isAbsolute(pathFromRoot)) {
+  if (pathFromRoot === "" || pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot)) {
     throw new Error(`Unsafe untracked ${description}: ${absolutePath}`);
   }
 }

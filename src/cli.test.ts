@@ -380,6 +380,31 @@ test("copies non-ignored untracked files and safe symlinks into the worker", (co
   assertRepositoryState(repositoryRoot, sourceState);
 });
 
+test("copies an untracked symlink to a tracked file whose name starts with two dots", (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  writeFileSync(join(repositoryRoot, "..config"), "Configuration\n");
+  runGit(repositoryRoot, ["add", "..config"]);
+  runGit(repositoryRoot, ["commit", "--quiet", "-m", "Add configuration fixture"]);
+  symlinkSync("..config", join(repositoryRoot, "config-link"));
+  const sourceState = captureRepositoryState(repositoryRoot);
+
+  createSeededWorktree(repository, worktree);
+
+  assert.equal(readlinkSync(join(worktree, "config-link")), "..config");
+  assert.equal(readFileSync(join(worktree, "config-link"), "utf8"), "Configuration\n");
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
 test("rejects untracked snapshots that exceed a file or byte limit", (context) => {
   const repositoryRoot = createRepository();
   const fileLimitWorktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
