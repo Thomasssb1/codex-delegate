@@ -1,6 +1,7 @@
 import { readSessionDurability, Session, spawnMspConnection, type SpawnedMspConnection } from "@muse-code/sdk";
 import { toMuseApprovalMode, type ApprovalMode } from "../approval-mode.js";
 import { rejectCancelledRun, RunCancelledError } from "../cancellation.js";
+import { nestedWorkerEnv } from "../nesting.js";
 import {
   ProviderRunError,
   type ApprovalRequest,
@@ -182,7 +183,7 @@ export class MuseProvider implements Provider {
       args: ["serve"],
       command: this.options.binary,
       cwd: request.workspaceRoot,
-      env: process.env,
+      env: nestedWorkerEnv(),
       onStderr: (chunk) => {
         stderr.push(chunk);
         request.onActivity?.();

@@ -43,6 +43,8 @@ The command prints JSON. On success it includes a `patch` and `response`. On fai
 
 Codex can use the installed `codex-delegate-test` and `codex-delegate-review` skills to delegate test writing or review work automatically.
 
+Delegated workers run with `CODEX_DELEGATE_ACTIVE=1` in their environment, and `codex-delegate run` refuses to nest inside a worker unless you pass `--allow-nested`. Worker agent profiles also instruct the subagent to do the work directly instead of delegating again.
+
 ## Project agents
 
 Add a file such as `.codex-agents/api-tester.md` to give a project its own agent. Project agents override bundled agents with the same name.

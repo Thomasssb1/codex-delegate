@@ -37,6 +37,7 @@ import {
 import { createInteractionResponder } from "./interaction.js";
 import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
+import { NESTING_ENV_VAR, isNestedRun, nestedRunRefusal, nestedWorkerEnv } from "./nesting.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
 import { museFailureMessage, MuseProvider } from "./provider/muse.js";
 import { resolveTask } from "./task.js";
@@ -1640,4 +1641,71 @@ test("rejects invalid timeout and approval-mode flags through the run command", 
   const approvalResult = runCli(repository, "run", "Do the task.", "--approval-mode", "sometimes");
   assert.notEqual(approvalResult.status, 0);
   assert.match(approvalResult.stderr, /Unsupported approval mode/);
+});
+
+test("marks worker environments so nested runs refuse by default", () => {
+  const workerEnv = nestedWorkerEnv({ PATH: "/usr/bin" });
+
+  assert.equal(workerEnv[NESTING_ENV_VAR], "1");
+  assert.equal(workerEnv.PATH, "/usr/bin");
+  assert.equal(isNestedRun(workerEnv), true);
+  assert.equal(isNestedRun({}), false);
+  assert.equal(isNestedRun({ [NESTING_ENV_VAR]: "0" }), false);
+  assert.match(nestedRunRefusal(), /--allow-nested/);
+});
+
+test("leaves the parent environment unchanged when marking a worker environment", () => {
+  const parentEnv = { PATH: "/usr/bin" };
+  nestedWorkerEnv(parentEnv);
+
+  assert.deepEqual(parentEnv, { PATH: "/usr/bin" });
+});
+
+test("refuses nested runs without --allow-nested", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  const previousMarker = process.env[NESTING_ENV_VAR];
+  process.env[NESTING_ENV_VAR] = "1";
+  context.after(() => {
+    if (previousMarker === undefined) {
+      delete process.env[NESTING_ENV_VAR];
+    } else {
+      process.env[NESTING_ENV_VAR] = previousMarker;
+    }
+  });
+
+  const result = runCli(repository, "run", "Do the task.", "--provider", "muse");
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /nested delegation is blocked/);
+  assert.match(result.stderr, /--allow-nested/);
+  assert.match(JSON.parse(result.stdout).error as string, /nested delegation is blocked/);
+});
+
+test("allows nested runs with --allow-nested", (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(directory, { force: true, recursive: true }));
+  const previousMarker = process.env[NESTING_ENV_VAR];
+  process.env[NESTING_ENV_VAR] = "1";
+  context.after(() => {
+    if (previousMarker === undefined) {
+      delete process.env[NESTING_ENV_VAR];
+    } else {
+      process.env[NESTING_ENV_VAR] = previousMarker;
+    }
+  });
+
+  const result = runCli(directory, "run", "Do the task.", "--provider", "muse", "--allow-nested");
+
+  assert.equal(result.status, 5);
+  assert.match(result.stderr, /Run codex-delegate from inside a non-bare Git worktree/);
+});
+
+test("tells delegated workers not to delegate again", () => {
+  for (const name of ["reviewer", "test-writer"]) {
+    assert.match(
+      loadAgent("/not-a-repository", name).instructions,
+      /Do not spawn subagents and do not use any `codex-delegate` skills/,
+    );
+  }
 });
