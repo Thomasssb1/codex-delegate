@@ -470,11 +470,12 @@ test("does not run repository hooks for the baseline commit", (context) => {
   assert.equal(existsSync(postCommitMarker), false);
 });
 
-test("returns only fake-provider changes and removes the worker", async (context) => {
-  const repositoryRoot = createRepository();
+test("returns only worker changes from a dirty caller checkout", async (context) => {
+  const repositoryRoot = createDirtyRepository();
   const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
   const repository = discoverRepository(repositoryRoot);
   context.after(() => rmSync(repositoryRoot, { force: true, recursive: true }));
+  const sourceState = captureRepositoryState(repositoryRoot);
   const provider: Provider = {
     async run({ workspaceRoot }) {
       writeFileSync(join(workspaceRoot, "agent.test.ts"), "export {};\n");
@@ -496,18 +497,28 @@ test("returns only fake-provider changes and removes the worker", async (context
 
   assert.deepEqual(result.changedFiles, ["agent.test.ts"]);
   assert.match(result.patch.toString("utf8"), /agent\.test\.ts/);
+  assert.doesNotMatch(result.patch.toString("utf8"), /Staged and unstaged change/);
+  assert.doesNotMatch(result.patch.toString("utf8"), /untracked\.txt/);
   assert.equal(result.response, "Added a test.");
   assert.equal(result.providerStderr, "provider diagnostic\n");
   assert.equal(existsSync(worktree), false);
   assert.equal(existsSync(join(repositoryRoot, "agent.test.ts")), false);
+  assertRepositoryState(repositoryRoot, sourceState);
 });
 
 test("removes the worker after a provider is cancelled", async (context) => {
-  const repositoryRoot = createRepository();
+  const repositoryRoot = createDirtyRepository();
   const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
   const repository = discoverRepository(repositoryRoot);
   const controller = new AbortController();
-  context.after(() => rmSync(repositoryRoot, { force: true, recursive: true }));
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+  const sourceState = captureRepositoryState(repositoryRoot);
   const provider: Provider = {
     async run({ signal }) {
       await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
@@ -526,6 +537,40 @@ test("removes the worker after a provider is cancelled", async (context) => {
 
   await assert.rejects(run, RunCancelledError);
   assert.equal(existsSync(worktree), false);
+  assertRepositoryState(repositoryRoot, sourceState);
+});
+
+test("removes the worker after a provider failure without changing the caller", async (context) => {
+  const repositoryRoot = createDirtyRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+  const sourceState = captureRepositoryState(repositoryRoot);
+  const provider: Provider = {
+    async run() {
+      throw new Error("The provider failed.");
+    },
+  };
+
+  await assert.rejects(
+    delegate({
+      prompt: "Write a test",
+      provider,
+      repository,
+      signal: new AbortController().signal,
+      worktree,
+    }),
+    /The provider failed\./,
+  );
+
+  assert.equal(existsSync(worktree), false);
+  assertRepositoryState(repositoryRoot, sourceState);
 });
 
 test("rejects a directory outside a Git repository", (context) => {
