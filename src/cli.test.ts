@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,10 @@ import { fileURLToPath } from "node:url";
 import { loadAcceptedProviders } from "./providers.js";
 import { discoverRepository } from "./repository.js";
 import { createSeededWorktree, removeWorktree } from "./worktree.js";
+import { delegate } from "./delegate.js";
+import type { Provider } from "./provider/provider.js";
+import { createPrompt } from "./prompt.js";
+import { loadAgent } from "./agents/loader.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
 
@@ -40,32 +44,48 @@ test("loads accepted providers from JSON", () => {
   assert.deepEqual(loadAcceptedProviders(), ["muse"]);
 });
 
-test("accepts a positional task in a Git repository", (context) => {
+test("creates a prompt from loaded instructions", () => {
+  const prompt = createPrompt("Review changes for regressions.", "Review the current changes.");
+
+  assert.match(prompt, /Review changes for regressions\./);
+  assert.match(prompt, /Task:\nReview the current changes\./);
+});
+
+test("loads the bundled test-writer agent", () => {
+  const agent = loadAgent("/not-a-repository", "test-writer");
+
+  assert.equal(agent.source, "bundled");
+  assert.match(agent.instructions, /Write tests for the behaviour described in the task\./);
+});
+
+test("uses a project agent before its bundled counterpart", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  writeFileSync(join(repository, ".codex-agents", "test-writer.md"), "Project instructions\n");
 
-  const result = runCli(
-    repository,
-    "run",
-    "test-writer",
-    "--provider",
-    "muse",
-    "Add a test for the empty input case",
-  );
+  const agent = loadAgent(repository, "test-writer");
 
-  assert.equal(result.status, 0);
-  assert.equal(
-    result.stdout,
-    "Run requested for test-writer with provider muse.\nTask: Add a test for the empty input case\n",
-  );
-  assert.equal(result.stderr, "");
+  assert.equal(agent.source, "project");
+  assert.equal(agent.instructions, "Project instructions");
+});
+
+test("uses a generic role prompt for an unknown agent", () => {
+  const agent = loadAgent("/not-a-repository", "reviewer");
+
+  assert.equal(agent.source, "generic");
+  assert.equal(agent.instructions, "You are acting as the reviewer agent. Complete the task carefully.");
+});
+
+test("rejects unsafe agent names", () => {
+  assert.throws(() => loadAgent("/not-a-repository", "../outside"), /Invalid agent name: \.\.\/outside/);
 });
 
 test("rejects providers other than Muse", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
 
-  const result = runCli(repository, "run", "test-writer", "--provider", "other", "Write a test");
+  const result = runCli(repository, "run", "Write a test", "--provider", "other");
 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Unsupported provider: other\. Supported providers: muse\./);
@@ -75,7 +95,7 @@ test("requires one non-empty positional task", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
 
-  const result = runCli(repository, "run", "test-writer", "--provider", "muse");
+  const result = runCli(repository, "run", "--provider", "muse");
 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /error: missing required argument 'task'/);
@@ -87,16 +107,7 @@ test("discovers the Git root from a nested directory", (context) => {
   context.after(() => rmSync(repository, { force: true, recursive: true }));
   mkdirSync(nestedDirectory);
 
-  const result = runCli(
-    nestedDirectory,
-    "run",
-    "test-writer",
-    "--provider",
-    "muse",
-    "Write a test",
-  );
-
-  assert.equal(result.status, 0);
+  assert.equal(discoverRepository(nestedDirectory).root, realpathSync(repository));
 });
 
 test("rejects a Git repository without a HEAD commit", (context) => {
@@ -104,7 +115,7 @@ test("rejects a Git repository without a HEAD commit", (context) => {
   context.after(() => rmSync(repository, { force: true, recursive: true }));
   runGit(repository, ["init", "--quiet"]);
 
-  const result = runCli(repository, "run", "test-writer", "--provider", "muse", "Write a test");
+  const result = runCli(repository, "run", "Write a test", "--provider", "muse");
 
   assert.equal(result.status, 5);
   assert.match(result.stderr, /The Git repository must have a valid HEAD commit\./);
@@ -115,10 +126,7 @@ test("accepts uncommitted changes for a later worker snapshot", (context) => {
   context.after(() => rmSync(repository, { force: true, recursive: true }));
   writeFileSync(join(repository, "untracked.txt"), "dirty\n");
 
-  const result = runCli(repository, "run", "test-writer", "--provider", "muse", "Write a test");
-
-  assert.equal(result.status, 0);
-  assert.equal(result.stderr, "");
+  assert.equal(discoverRepository(repository).root, realpathSync(repository));
 });
 
 test("seeds a worker with caller changes without changing the caller", (context) => {
@@ -167,11 +175,37 @@ test("seeds a worker with caller changes without changing the caller", (context)
   assert.doesNotMatch(workerPatch, /untracked\.txt/);
 });
 
+test("returns only fake-provider changes and removes the worker", async (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => rmSync(repositoryRoot, { force: true, recursive: true }));
+  const provider: Provider = {
+    async run({ workspaceRoot }) {
+      writeFileSync(join(workspaceRoot, "agent.test.ts"), "export {};\n");
+
+      return {
+        response: "Added a test.",
+        stderr: "provider diagnostic\n",
+      };
+    },
+  };
+
+  const result = await delegate(repository, worktree, "Write a test", provider);
+
+  assert.deepEqual(result.changedFiles, ["agent.test.ts"]);
+  assert.match(result.patch.toString("utf8"), /agent\.test\.ts/);
+  assert.equal(result.response, "Added a test.");
+  assert.equal(result.providerStderr, "provider diagnostic\n");
+  assert.equal(existsSync(worktree), false);
+  assert.equal(existsSync(join(repositoryRoot, "agent.test.ts")), false);
+});
+
 test("rejects a directory outside a Git repository", (context) => {
   const directory = mkdtempSync(join(tmpdir(), "codex-delegate-"));
   context.after(() => rmSync(directory, { force: true, recursive: true }));
 
-  const result = runCli(directory, "run", "test-writer", "--provider", "muse", "Write a test");
+  const result = runCli(directory, "run", "Write a test", "--provider", "muse");
 
   assert.equal(result.status, 5);
   assert.match(result.stderr, /Run codex-delegate from inside a non-bare Git worktree\./);
