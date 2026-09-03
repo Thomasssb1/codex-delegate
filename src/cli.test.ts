@@ -155,6 +155,16 @@ test("loads the bundled test-writer agent", () => {
   assert.equal(agent.provider, "muse");
   assert.equal(agent.approvalMode, "approveForMe");
   assert.match(agent.instructions, /Write tests for the behaviour described in the task\./);
+  assert.match(agent.instructions, /"summary": "What you changed"/);
+});
+
+test("loads the bundled reviewer agent", () => {
+  const agent = loadAgent("/not-a-repository", "reviewer");
+
+  assert.equal(agent.source, "bundled");
+  assert.equal(agent.description, "Review the current changes for correctness and regressions.");
+  assert.match(agent.instructions, /Do not modify files or commit\./);
+  assert.match(agent.instructions, /"verdict": "approved" \| "changes_requested"/);
 });
 
 test("uses a project agent before its bundled counterpart", (context) => {
@@ -173,10 +183,23 @@ test("uses a project agent before its bundled counterpart", (context) => {
 });
 
 test("rejects an unknown agent profile", () => {
-  assert.throws(() => loadAgent("/not-a-repository", "reviewer"), /Agent profile not found: reviewer/);
+  assert.throws(() => loadAgent("/not-a-repository", "missing-agent"), /Agent profile not found: missing-agent/);
 });
 
-test("rejects output metadata until the wrapper uses it", (context) => {
+test("rejects removed output metadata", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+  const profilePath = join(repository, ".codex-agents", "test-writer.md");
+
+  writeFileSync(
+    profilePath,
+    "---\nname: test-writer\ndescription: Project test instructions.\noutput: change\n---\nProject instructions\n",
+  );
+  assert.throws(() => loadAgent(repository, "test-writer"), /unknown front matter key: output/);
+});
+
+test("rejects unknown profile metadata", (context) => {
   const repository = createRepository();
   context.after(() => rmSync(repository, { force: true, recursive: true }));
   mkdirSync(join(repository, ".codex-agents"));
@@ -350,6 +373,18 @@ test("fails an interaction when Codex closes stdin", async () => {
 
   await assert.rejects(pending, /closed stdin while Muse was waiting/);
   responder.close();
+});
+
+test("rejects removed change rules", (context) => {
+  const repository = createRepository();
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  mkdirSync(join(repository, ".codex-agents"));
+
+  writeFileSync(
+    join(repository, ".codex-agents", "test-writer.md"),
+    "---\nname: test-writer\ndescription: Project test instructions.\nchanges:\n  allow:\n    - src/**/*.test.ts\n---\nProject instructions\n",
+  );
+  assert.throws(() => loadAgent(repository, "test-writer"), /unknown front matter key: changes/);
 });
 
 test("resolves repository configuration with CLI and profile precedence", (context) => {
