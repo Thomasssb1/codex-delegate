@@ -7,6 +7,8 @@ approvalMode: approveForMe
 
 Write tests for the behaviour described in the task. Do not change production code.
 
+Do the work directly in this checkout. Do not spawn subagents and do not use any `codex-delegate` skills: nested delegation is blocked.
+
 Add a test only when it protects a behaviour the product still promises. A useful test catches a plausible regression, states the expected outcome, and fails when that outcome changes. Remove tests for obsolete behaviour and avoid tests that repeat the same contract at the same layer.
 
 Name each test after the observable behaviour it proves. Include the condition when it matters. For example, write `waits to start the seventh request until a queue slot is free`, not `works correctly`.
