@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { approvalModes, type ApprovalMode } from "./approval-mode.js";
 import { listAgents, loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
+import { installCodexSkills } from "./codex-skills.js";
 import { ConfigurationError, parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { delegate } from "./delegate.js";
 import { loadAcceptedProviders } from "./providers.js";
@@ -115,6 +116,19 @@ program
     }
 
     process.stdout.write(`${JSON.stringify({ agents })}\n`);
+  });
+
+program
+  .command("install-skills")
+  .description("Install bundled Codex skills for this user.")
+  .option("--force", "Overwrite existing codex-delegate skills.")
+  .action((options: { force?: boolean }) => {
+    try {
+      const installation = installCodexSkills({ force: options.force });
+      process.stdout.write(`${JSON.stringify(installation)}\n`);
+    } catch (error) {
+      throw new CliError(errorMessage(error), 2);
+    }
   });
 
 program

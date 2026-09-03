@@ -34,6 +34,7 @@ import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
 import { museFailureMessage, MuseProvider } from "./provider/muse.js";
 import { resolveTask } from "./task.js";
+import { installCodexSkills } from "./codex-skills.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
 
@@ -161,6 +162,30 @@ test("preserves a Muse terminal failure's details", () => {
       },
     }),
     "Muse run failed (modelError): Usage limit exhausted.",
+  );
+});
+
+test("installs the bundled Codex skills", (context) => {
+  const codexHome = mkdtempSync(join(tmpdir(), "codex-home-"));
+  context.after(() => rmSync(codexHome, { force: true, recursive: true }));
+
+  const installation = installCodexSkills({ codexHome });
+
+  assert.deepEqual(installation, {
+    installed: ["codex-delegate", "codex-delegate-review", "codex-delegate-test"],
+    skillsDirectory: join(codexHome, "skills"),
+  });
+  assert.match(
+    readFileSync(join(codexHome, "skills", "codex-delegate-test", "SKILL.md"), "utf8"),
+    /Use the `codex-delegate` skill to list agents/,
+  );
+  assert.throws(() => installCodexSkills({ codexHome }), /Codex skills already installed/);
+
+  writeFileSync(join(codexHome, "skills", "codex-delegate", "SKILL.md"), "outdated instructions\n");
+  installCodexSkills({ codexHome, force: true });
+  assert.match(
+    readFileSync(join(codexHome, "skills", "codex-delegate", "SKILL.md"), "utf8"),
+    /complete the task yourself/,
   );
 });
 
