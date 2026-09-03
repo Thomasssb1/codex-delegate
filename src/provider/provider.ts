@@ -9,6 +9,17 @@ export type ProviderResult = {
   stderr: string;
 };
 
+export class ProviderRunError extends Error {
+  constructor(
+    message: string,
+    readonly stderr: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "ProviderRunError";
+  }
+}
+
 export interface Provider {
   run(request: ProviderRequest): Promise<ProviderResult>;
 }

@@ -1,6 +1,6 @@
 import { MuseClient } from "@muse-code/sdk";
-import { rejectCancelledRun } from "../cancellation.js";
-import type { Provider, ProviderRequest, ProviderResult } from "./provider.js";
+import { rejectCancelledRun, RunCancelledError } from "../cancellation.js";
+import { ProviderRunError, type Provider, type ProviderRequest, type ProviderResult } from "./provider.js";
 
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Muse run was aborted.");
@@ -39,6 +39,19 @@ function waitForClient(clientPromise: Promise<MuseClient>, signal: AbortSignal):
 export class MuseProvider implements Provider {
   async run(request: ProviderRequest): Promise<ProviderResult> {
     const stderr: string[] = [];
+
+    try {
+      return await this.runTurn(request, stderr);
+    } catch (error) {
+      if (error instanceof RunCancelledError) {
+        throw error;
+      }
+
+      throw new ProviderRunError(error instanceof Error ? error.message : String(error), stderr.join(""), { cause: error });
+    }
+  }
+
+  private async runTurn(request: ProviderRequest, stderr: string[]): Promise<ProviderResult> {
     rejectCancelledRun(request.signal);
 
     const clientPromise = MuseClient.spawn({

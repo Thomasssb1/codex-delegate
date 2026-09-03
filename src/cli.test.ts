@@ -15,6 +15,7 @@ import type { Provider } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
+import { createFailedRunResult, createRunResult } from "./run-result.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
 
@@ -51,6 +52,30 @@ test("creates a prompt from loaded instructions", () => {
 
   assert.match(prompt, /Review changes for regressions\./);
   assert.match(prompt, /Task:\nReview the current changes\./);
+});
+
+test("returns raw worker output in the JSON result", () => {
+  const result = createRunResult({
+    changedFiles: ["src/cli.test.ts"],
+    patch: Buffer.from("diff --git a/src/cli.test.ts b/src/cli.test.ts\n"),
+    providerStderr: "provider diagnostic\n",
+    response: "Added a test.",
+  });
+
+  assert.deepEqual(result, {
+    patch: "diff --git a/src/cli.test.ts b/src/cli.test.ts\n",
+    response: "Added a test.",
+    stderr: "provider diagnostic\n",
+  });
+});
+
+test("returns raw diagnostics with a failed JSON result", () => {
+  const result = createFailedRunResult("Muse did not complete the turn successfully.", "host warning\n");
+
+  assert.deepEqual(result, {
+    error: "Muse did not complete the turn successfully.",
+    stderr: "host warning\n",
+  });
 });
 
 test("loads the bundled test-writer agent", () => {
@@ -141,6 +166,20 @@ test("rejects a Git repository without a HEAD commit", (context) => {
   const result = runCli(repository, "run", "Write a test", "--provider", "muse");
 
   assert.equal(result.status, 5);
+  assert.match(result.stderr, /The Git repository must have a valid HEAD commit\./);
+});
+
+test("returns a JSON failure result when repository discovery fails", (context) => {
+  const repository = mkdtempSync(join(tmpdir(), "codex-delegate-"));
+  context.after(() => rmSync(repository, { force: true, recursive: true }));
+  runGit(repository, ["init", "--quiet"]);
+
+  const result = runCli(repository, "run", "Write a test", "--provider", "muse", "--json");
+
+  assert.equal(result.status, 5);
+  const output = JSON.parse(result.stdout) as Record<string, unknown>;
+  assert.equal(output.error, "The Git repository must have a valid HEAD commit.");
+  assert.equal(output.stderr, "");
   assert.match(result.stderr, /The Git repository must have a valid HEAD commit\./);
 });
 
