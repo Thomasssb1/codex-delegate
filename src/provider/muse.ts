@@ -18,6 +18,30 @@ export type MuseProviderOptions = {
   model?: string;
 };
 
+type MuseTurnOutcome = {
+  kind: string;
+  params?: unknown;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export function museFailureMessage(outcome: MuseTurnOutcome): string {
+  if (outcome.kind === "completed" && isRecord(outcome.params) && outcome.params.terminal === "failed") {
+    const failure = outcome.params.error;
+    if (isRecord(failure) && typeof failure.kind === "string" && typeof failure.message === "string") {
+      return `Muse run failed (${failure.kind}): ${failure.message}`;
+    }
+
+    if (typeof outcome.params.reason === "string") {
+      return `Muse did not complete the turn successfully: ${outcome.params.reason}`;
+    }
+  }
+
+  return "Muse did not complete the turn successfully.";
+}
+
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Muse run was aborted.");
 }
@@ -284,7 +308,7 @@ export class MuseProvider implements Provider {
       await Promise.race([collectResponses(), interactionFailure]);
       const outcome = await Promise.race([turn.completed, interactionFailure]);
       if (outcome.kind !== "completed" || outcome.params.terminal !== "completed") {
-        throw new Error("Muse did not complete the turn successfully.");
+        throw new Error(museFailureMessage(outcome));
       }
 
       providerResult = { response: [...responses.values()].join("\n"), stderr: stderr.join("") };

@@ -32,7 +32,7 @@ import { createInteractionResponder } from "./interaction.js";
 import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
-import { MuseProvider } from "./provider/muse.js";
+import { museFailureMessage, MuseProvider } from "./provider/muse.js";
 import { resolveTask } from "./task.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
@@ -146,6 +146,22 @@ test("returns raw diagnostics with a failed JSON result", () => {
     error: "Muse did not complete the turn successfully.",
     stderr: "host warning\n",
   });
+});
+
+test("preserves a Muse terminal failure's details", () => {
+  assert.equal(
+    museFailureMessage({
+      kind: "completed",
+      params: {
+        error: {
+          kind: "modelError",
+          message: "Usage limit exhausted.",
+        },
+        terminal: "failed",
+      },
+    }),
+    "Muse run failed (modelError): Usage limit exhausted.",
+  );
 });
 
 test("loads the bundled test-writer agent", () => {
