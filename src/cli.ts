@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { Command, InvalidArgumentError } from "commander";
+import { Command, CommanderError, InvalidArgumentError } from "commander";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,10 +54,15 @@ function exitCodeFor(error: unknown): number {
     return error.exitCode;
   }
 
+  if (error instanceof CommanderError) {
+    return error.exitCode;
+  }
+
   return error instanceof RunCancelledError && error.cause === "signal" ? 130 : 4;
 }
 
 const program = new Command();
+program.exitOverride();
 
 program
   .name("codex-delegate")
@@ -67,9 +72,8 @@ program
   .command("run <task> [agent]")
   .description("Delegate a task to an agent.")
   .requiredOption("--provider <provider>", "Provider to use.", parseProvider)
-  .option("--json", "Write a machine-readable result to stdout.")
   .allowExcessArguments(false)
-  .action(async (task: string, agent = "test-writer", options: { json?: boolean; provider: Provider }) => {
+  .action(async (task: string, agent = "test-writer") => {
     let cancellation: ReturnType<typeof createRunCancellation> | undefined;
 
     try {
@@ -99,20 +103,8 @@ program
       process.stderr.write(`Muse completed with ${result.changedFiles.length} changed file(s).\n`);
       const runResult = createRunResult(result);
 
-      if (options.json) {
-        process.stdout.write(`${JSON.stringify(runResult)}\n`);
-        return;
-      }
-
-      process.stdout.write(result.response);
-      if (result.response !== "" && !result.response.endsWith("\n")) {
-        process.stdout.write("\n");
-      }
+      process.stdout.write(`${JSON.stringify(runResult)}\n`);
     } catch (error) {
-      if (!options.json) {
-        throw error;
-      }
-
       const runResult = createFailedRunResult(
         errorMessage(error),
         error instanceof ProviderRunError ? error.stderr : undefined,
@@ -127,6 +119,9 @@ program
   });
 
 program.parseAsync().catch((error: unknown) => {
-  process.stderr.write(`${errorMessage(error)}\n`);
+  const runResult = createFailedRunResult(errorMessage(error));
+
+  process.stderr.write(`${runResult.error}\n`);
+  process.stdout.write(`${JSON.stringify(runResult)}\n`);
   process.exitCode = exitCodeFor(error);
 });

@@ -137,6 +137,9 @@ test("rejects providers other than Muse", (context) => {
 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Unsupported provider: other\. Supported providers: muse\./);
+  const output = JSON.parse(result.stdout) as Record<string, unknown>;
+  assert.match(output.error as string, /Unsupported provider: other\. Supported providers: muse\./);
+  assert.equal(output.stderr, "");
 });
 
 test("requires one non-empty positional task", (context) => {
@@ -169,12 +172,12 @@ test("rejects a Git repository without a HEAD commit", (context) => {
   assert.match(result.stderr, /The Git repository must have a valid HEAD commit\./);
 });
 
-test("returns a JSON failure result when repository discovery fails", (context) => {
+test("returns a JSON failure result by default when repository discovery fails", (context) => {
   const repository = mkdtempSync(join(tmpdir(), "codex-delegate-"));
   context.after(() => rmSync(repository, { force: true, recursive: true }));
   runGit(repository, ["init", "--quiet"]);
 
-  const result = runCli(repository, "run", "Write a test", "--provider", "muse", "--json");
+  const result = runCli(repository, "run", "Write a test", "--provider", "muse");
 
   assert.equal(result.status, 5);
   const output = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -198,7 +201,6 @@ test(
       "e2e",
       "--provider",
       "muse",
-      "--json",
     );
 
     assert.equal(result.status, 0, result.stderr);
