@@ -6,7 +6,9 @@
   "type": "module",
   "files": [
     "dist",
-    "skills"
+    "skills",
+    "providers.json",
+    "agents"
   ],
   "engines": {
     "node": ">=20"
