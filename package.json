@@ -10,6 +10,10 @@
   "bin": {
     "codex-delegate": "./dist/cli.js"
   },
+  "dependencies": {
+    "@muse-code/sdk": "0.1.1",
+    "commander": "^13.1.0"
+  },
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "lint": "eslint .",
@@ -17,8 +21,8 @@
     "test": "npm run build && node --test dist/cli.test.js"
   },
   "devDependencies": {
-    "@types/node": "22.10.2",
     "@eslint/js": "^10.0.1",
+    "@types/node": "22.10.2",
     "eslint": "^10.7.0",
     "globals": "^17.7.0",
     "typescript": "5.7.2",
