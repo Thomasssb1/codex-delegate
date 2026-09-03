@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import {
   chmodSync,
   existsSync,
@@ -27,6 +28,7 @@ import type { Provider } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { loadAgent } from "./agents/loader.js";
 import { createRunCancellation, RunCancelledError } from "./cancellation.js";
+import { createInteractionResponder } from "./interaction.js";
 import { toMuseApprovalMode } from "./approval-mode.js";
 import { parseInactivityTimeout, resolveRunConfiguration } from "./config.js";
 import { createFailedRunResult, createRunResult } from "./run-result.js";
@@ -243,6 +245,111 @@ test("defaults a run to approveForMe", () => {
   });
 
   assert.equal(configuration.muse.approvalMode, "approveForMe");
+});
+
+function approvalRequest() {
+  return {
+    approvalId: "approval",
+    choices: [
+      { choiceId: "allow", decision: "approved", label: "Allow" },
+      { acceptsFeedback: true, choiceId: "deny", decision: "denied", label: "Deny" },
+    ],
+    kind: "approval" as const,
+    requirementId: { approvalId: "approval", sourceIndex: 1 },
+    toolName: "shell",
+    turnId: "turn",
+  };
+}
+
+function userInputRequest() {
+  return {
+    kind: "userInput" as const,
+    questions: [
+      {
+        header: "Colour",
+        id: "colour",
+        options: [{ label: "Blue" }, { label: "Red" }],
+        question: "Which colour?",
+        selection: { mode: "single" as const },
+      },
+      {
+        header: "Features",
+        id: "features",
+        options: [{ label: "Fast" }, { label: "Small" }],
+        question: "Which features?",
+        selection: { maxSelections: 2, minSelections: 1, mode: "multiple" as const },
+      },
+    ],
+    toolName: "ask_user",
+    turnId: "turn",
+    userInputId: "input",
+  };
+}
+
+function createTestResponder() {
+  const input = new PassThrough();
+  const output: string[] = [];
+  const responder = createInteractionResponder(input, { write: (chunk) => output.push(chunk) });
+
+  return { input, output, responder };
+}
+
+test("streams an approval request and accepts an offered choice", async () => {
+  const { input, output, responder } = createTestResponder();
+  const pending = responder.request(approvalRequest());
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(output[0]), { interaction: approvalRequest(), status: "interaction_required" });
+  input.write('{"choiceId":"deny","feedback":"Use the safe path."}\n');
+
+  await assert.doesNotReject(pending);
+  assert.deepEqual(await pending, { choiceId: "deny", feedback: "Use the safe path.", kind: "approval" });
+  responder.close();
+});
+
+test("streams multiple user-input answers", async () => {
+  const { input, output, responder } = createTestResponder();
+  const pending = responder.request(userInputRequest());
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(output[0]), { interaction: userInputRequest(), status: "interaction_required" });
+  input.write('{"answers":[{"questionId":"colour","selectedLabel":"Blue"},{"questionId":"features","selectedLabels":["Fast","Small"]}]}\n');
+
+  assert.deepEqual(await pending, {
+    answers: [
+      { questionId: "colour", selectedLabel: "Blue" },
+      { questionId: "features", selectedLabels: ["Fast", "Small"] },
+    ],
+    kind: "userInput",
+  });
+  responder.close();
+});
+
+test("serializes back-to-back Muse requests", async () => {
+  const { input, output, responder } = createTestResponder();
+  const approval = responder.request(approvalRequest());
+  const inputRequest = responder.request(userInputRequest());
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(output.length, 1);
+  input.write('{"choiceId":"allow"}\n');
+  await approval;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(output.length, 2);
+  input.write('{"answers":[]}\n');
+
+  assert.deepEqual(await inputRequest, { answers: [], kind: "userInput" });
+  responder.close();
+});
+
+test("fails an interaction when Codex closes stdin", async () => {
+  const { input, responder } = createTestResponder();
+  const pending = responder.request(approvalRequest());
+
+  input.end();
+
+  await assert.rejects(pending, /closed stdin while Muse was waiting/);
+  responder.close();
 });
 
 test("resolves repository configuration with CLI and profile precedence", (context) => {
