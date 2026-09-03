@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import test from "node:test";
@@ -274,6 +274,38 @@ test("seeds a worker with caller changes without changing the caller", (context)
   assert.match(workerPatch, /agent\.test\.ts/);
   assert.doesNotMatch(workerPatch, /Staged and unstaged change/);
   assert.doesNotMatch(workerPatch, /untracked\.txt/);
+});
+
+test("does not run repository hooks for the baseline commit", (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const prepareCommitMsgMarker = join(tmpdir(), `codex-delegate-prepare-commit-msg-${randomUUID()}`);
+  const postCommitMarker = join(tmpdir(), `codex-delegate-post-commit-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  context.after(() => {
+    if (existsSync(worktree)) {
+      removeWorktree(repository, worktree);
+    }
+
+    rmSync(prepareCommitMsgMarker, { force: true });
+    rmSync(postCommitMarker, { force: true });
+    rmSync(repositoryRoot, { force: true, recursive: true });
+  });
+
+  const hooksDirectory = join(repositoryRoot, ".git", "hooks");
+  writeFileSync(
+    join(hooksDirectory, "prepare-commit-msg"),
+    `#!/bin/sh\ntouch ${JSON.stringify(prepareCommitMsgMarker)}\nexit 1\n`,
+  );
+  writeFileSync(join(hooksDirectory, "post-commit"), `#!/bin/sh\ntouch ${JSON.stringify(postCommitMarker)}\nexit 1\n`);
+  chmodSync(join(hooksDirectory, "prepare-commit-msg"), 0o755);
+  chmodSync(join(hooksDirectory, "post-commit"), 0o755);
+
+  const snapshot = createSeededWorktree(repository, worktree);
+
+  assert.notEqual(snapshot.baseline, repository.head);
+  assert.equal(existsSync(prepareCommitMsgMarker), false);
+  assert.equal(existsSync(postCommitMarker), false);
 });
 
 test("returns only fake-provider changes and removes the worker", async (context) => {

@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readlinkSync, symlinkSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Repository } from "./repository.js";
 
 export type WorkerSnapshot = {
@@ -110,19 +110,27 @@ export function createSeededWorktree(repository: Repository, worktree: string): 
     }
 
     runGit(worktree, ["add", "--all"]);
-    runGit(worktree, [
-      "-c",
-      "user.name=codex-delegate",
-      "-c",
-      "user.email=codex-delegate@localhost",
-      "-c",
-      "commit.gpgSign=false",
-      "commit",
-      "--allow-empty",
-      "--no-verify",
-      "-m",
-      "codex-delegate baseline",
-    ]);
+    const hooksPath = mkdtempSync(join(worktree, ".codex-delegate-hooks-"));
+
+    try {
+      runGit(worktree, [
+        "-c",
+        "user.name=codex-delegate",
+        "-c",
+        "user.email=codex-delegate@localhost",
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        `core.hooksPath=${hooksPath}`,
+        "commit",
+        "--allow-empty",
+        "--no-verify",
+        "-m",
+        "codex-delegate baseline",
+      ]);
+    } finally {
+      rmSync(hooksPath, { force: true, recursive: true });
+    }
 
     const baseline = runGit(worktree, ["rev-parse", "--verify", "HEAD^{commit}"])
       .toString("utf8")
