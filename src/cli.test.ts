@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import { delegate } from "./delegate.js";
 import type { Provider } from "./provider/provider.js";
 import { createPrompt } from "./prompt.js";
 import { loadAgent } from "./agents/loader.js";
+import { createRunCancellation, RunCancelledError } from "./cancellation.js";
 
 const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
 
@@ -75,6 +77,27 @@ test("uses a generic role prompt for an unknown agent", () => {
 
   assert.equal(agent.source, "generic");
   assert.equal(agent.instructions, "You are acting as the reviewer agent. Complete the task carefully.");
+});
+
+test("cancels a run when its timeout elapses", async () => {
+  const cancellation = createRunCancellation(1, new EventEmitter());
+
+  await new Promise<void>((resolve) => cancellation.signal.addEventListener("abort", () => resolve(), { once: true }));
+
+  assert.equal(cancellation.signal.reason instanceof RunCancelledError, true);
+  assert.equal(cancellation.signal.reason.cause, "timeout");
+  cancellation.dispose();
+});
+
+test("cancels a run when it receives SIGINT", () => {
+  const signals = new EventEmitter();
+  const cancellation = createRunCancellation(60_000, signals);
+
+  signals.emit("SIGINT");
+
+  assert.equal(cancellation.signal.reason instanceof RunCancelledError, true);
+  assert.equal(cancellation.signal.reason.cause, "signal");
+  cancellation.dispose();
 });
 
 test("rejects unsafe agent names", () => {
@@ -191,7 +214,13 @@ test("returns only fake-provider changes and removes the worker", async (context
     },
   };
 
-  const result = await delegate(repository, worktree, "Write a test", provider);
+  const result = await delegate({
+    prompt: "Write a test",
+    provider,
+    repository,
+    signal: new AbortController().signal,
+    worktree,
+  });
 
   assert.deepEqual(result.changedFiles, ["agent.test.ts"]);
   assert.match(result.patch.toString("utf8"), /agent\.test\.ts/);
@@ -199,6 +228,32 @@ test("returns only fake-provider changes and removes the worker", async (context
   assert.equal(result.providerStderr, "provider diagnostic\n");
   assert.equal(existsSync(worktree), false);
   assert.equal(existsSync(join(repositoryRoot, "agent.test.ts")), false);
+});
+
+test("removes the worker after a provider is cancelled", async (context) => {
+  const repositoryRoot = createRepository();
+  const worktree = join(tmpdir(), `codex-delegate-worktree-${randomUUID()}`);
+  const repository = discoverRepository(repositoryRoot);
+  const controller = new AbortController();
+  context.after(() => rmSync(repositoryRoot, { force: true, recursive: true }));
+  const provider: Provider = {
+    async run({ signal }) {
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      throw signal.reason;
+    },
+  };
+
+  const run = delegate({
+    prompt: "Write a test",
+    provider,
+    repository,
+    signal: controller.signal,
+    worktree,
+  });
+  controller.abort(new RunCancelledError("signal"));
+
+  await assert.rejects(run, RunCancelledError);
+  assert.equal(existsSync(worktree), false);
 });
 
 test("rejects a directory outside a Git repository", (context) => {

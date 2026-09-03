@@ -1,5 +1,6 @@
 export type ProviderRequest = {
   prompt: string;
+  signal: AbortSignal;
   workspaceRoot: string;
 };
 

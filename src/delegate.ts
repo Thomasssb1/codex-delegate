@@ -1,3 +1,4 @@
+import { rejectCancelledRun } from "./cancellation.js";
 import type { Provider } from "./provider/provider.js";
 import type { Repository } from "./repository.js";
 import { collectWorktreeChanges, createSeededWorktree, removeWorktree } from "./worktree.js";
@@ -9,17 +10,22 @@ export type DelegationResult = {
   response: string;
 };
 
-export async function delegate(
-  repository: Repository,
-  worktree: string,
-  prompt: string,
-  provider: Provider,
-): Promise<DelegationResult> {
-  const snapshot = createSeededWorktree(repository, worktree);
+export type DelegationRequest = {
+  prompt: string;
+  provider: Provider;
+  repository: Repository;
+  signal: AbortSignal;
+  worktree: string;
+};
+
+export async function delegate(request: DelegationRequest): Promise<DelegationResult> {
+  rejectCancelledRun(request.signal);
+  const snapshot = createSeededWorktree(request.repository, request.worktree);
 
   try {
-    const providerResult = await provider.run({
-      prompt,
+    const providerResult = await request.provider.run({
+      prompt: request.prompt,
+      signal: request.signal,
       workspaceRoot: snapshot.worktree,
     });
     const changes = collectWorktreeChanges(snapshot.worktree, snapshot.baseline);
@@ -30,6 +36,6 @@ export async function delegate(
       response: providerResult.response,
     };
   } finally {
-    removeWorktree(repository, snapshot.worktree);
+    removeWorktree(request.repository, snapshot.worktree);
   }
 }

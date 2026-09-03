@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadAgent } from "./agents/loader.js";
+import { createRunCancellation, RunCancelledError } from "./cancellation.js";
 import { delegate } from "./delegate.js";
 import { loadAcceptedProviders } from "./providers.js";
 import { MuseProvider } from "./provider/muse.js";
@@ -68,19 +69,28 @@ program
     }
 
     const worktree = join(tmpdir(), `codex-delegate-${randomUUID()}`);
+    const cancellation = createRunCancellation();
 
-    return delegate(repository, worktree, createPrompt(profile.instructions, task), new MuseProvider()).then((result) => {
-      process.stderr.write(`Muse completed with ${result.changedFiles.length} changed file(s).\n`);
-      process.stdout.write(result.response);
-      if (result.response !== "" && !result.response.endsWith("\n")) {
-        process.stdout.write("\n");
-      }
-    });
+    return delegate({
+      prompt: createPrompt(profile.instructions, task),
+      provider: new MuseProvider(),
+      repository,
+      signal: cancellation.signal,
+      worktree,
+    })
+      .then((result) => {
+        process.stderr.write(`Muse completed with ${result.changedFiles.length} changed file(s).\n`);
+        process.stdout.write(result.response);
+        if (result.response !== "" && !result.response.endsWith("\n")) {
+          process.stdout.write("\n");
+        }
+      })
+      .finally(() => cancellation.dispose());
   });
 
 program.parseAsync().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
 
   process.stderr.write(`${message}\n`);
-  process.exitCode = error instanceof CliError ? error.exitCode : 4;
+  process.exitCode = error instanceof CliError ? error.exitCode : error instanceof RunCancelledError && error.cause === "signal" ? 130 : 4;
 });

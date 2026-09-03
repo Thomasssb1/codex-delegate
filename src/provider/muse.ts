@@ -1,10 +1,47 @@
 import { MuseClient } from "@muse-code/sdk";
+import { rejectCancelledRun } from "../cancellation.js";
 import type { Provider, ProviderRequest, ProviderResult } from "./provider.js";
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("Muse run was aborted.");
+}
+
+function waitForClient(clientPromise: Promise<MuseClient>, signal: AbortSignal): Promise<MuseClient> {
+  if (signal.aborted) {
+    void clientPromise.then((client) => client.close()).catch(() => undefined);
+    return Promise.reject(abortReason(signal));
+  }
+
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(abortReason(signal));
+
+    signal.addEventListener("abort", abort, { once: true });
+    clientPromise.then(
+      (client) => {
+        signal.removeEventListener("abort", abort);
+
+        if (signal.aborted) {
+          void client.close().catch(() => undefined);
+          reject(abortReason(signal));
+          return;
+        }
+
+        resolve(client);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
+  });
+}
 
 export class MuseProvider implements Provider {
   async run(request: ProviderRequest): Promise<ProviderResult> {
     const stderr: string[] = [];
-    const client = await MuseClient.spawn({
+    rejectCancelledRun(request.signal);
+
+    const clientPromise = MuseClient.spawn({
       args: ["serve"],
       clientInfo: {
         name: "codex_delegate",
@@ -15,8 +52,23 @@ export class MuseProvider implements Provider {
       museBin: "muse",
       onStderr: (chunk) => stderr.push(chunk),
     });
+    const client = await waitForClient(clientPromise, request.signal);
+
+    let closePromise: Promise<void> | undefined;
+    const closeClient = () => {
+      closePromise ??= client.close();
+      return closePromise;
+    };
+    const abort = () => {
+      void closeClient();
+    };
+
+    request.signal.addEventListener("abort", abort, { once: true });
+    let providerResult: ProviderResult | undefined;
+    let closeError: unknown;
 
     try {
+      rejectCancelledRun(request.signal);
       const session = await client.startSession({
         approvalMode: "denyUnmatched",
         workspaceRoot: request.workspaceRoot,
@@ -34,16 +86,39 @@ export class MuseProvider implements Provider {
 
       const outcome = await turn.completed;
 
+      rejectCancelledRun(request.signal);
+
       if (outcome.kind !== "completed" || outcome.params.terminal !== "completed") {
         throw new Error("Muse did not complete the turn successfully.");
       }
 
-      return {
+      providerResult = {
         response: [...responses.values()].join("\n"),
         stderr: stderr.join(""),
       };
+    } catch (error) {
+      rejectCancelledRun(request.signal);
+      throw error;
     } finally {
-      await client.close();
+      request.signal.removeEventListener("abort", abort);
+
+      try {
+        await closeClient();
+      } catch (error) {
+        if (!request.signal.aborted) {
+          closeError = error;
+        }
+      }
     }
+
+    if (closeError !== undefined) {
+      throw closeError;
+    }
+
+    if (providerResult === undefined) {
+      throw new Error("Muse did not return a result.");
+    }
+
+    return providerResult;
   }
 }
